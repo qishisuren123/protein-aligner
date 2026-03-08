@@ -1,0 +1,91 @@
+# Cryo-EM 数据处理管线默认配置
+
+# 数据检索配置
+retrieval:
+  # EMDB API
+  emdb_api_base: "https://www.ebi.ac.uk/emdb/api"
+  emdb_ftp_base: "https://ftp.ebi.ac.uk/pub/databases/emdb/structures"
+  # RCSB API
+  rcsb_api_base: "https://data.rcsb.org/rest/v1/core"
+  rcsb_download_base: "https://files.rcsb.org/download"
+  # 筛选条件
+  resolution_min: 0.0   # 最小分辨率 (Å)
+  resolution_max: 4.0   # 最大分辨率 (Å)
+  method: "singleParticle"  # 成像方法
+  max_entries: 5        # 最大下载条目数（样例模式）
+
+# 重采样配置
+resample:
+  target_voxel_sizes: [1.0]  # 目标体素大小 (Å)
+  interpolation_order: 3     # 插值阶数 (3=cubic)
+
+# 归一化配置
+normalization:
+  percentile: 95        # 使用第N百分位数进行归一化
+  clip_min: 0.0
+  clip_max: 1.0
+
+# 对齐与质量控制配置
+alignment_qc:
+  # 模拟密度图参数
+  sim_resolution: 3.0   # 模拟密度图分辨率 (Å)
+  # 质量阈值
+  cc_threshold: 0.5     # CC_mask 最低阈值
+  # 对齐搜索参数
+  search_range: 5.0     # 搜索范围 (Å)
+  search_step: 1.0      # 搜索步长 (Å)
+
+# 对应标注配置
+correspondence:
+  # 原子类型标签: CA=1, N=2, C=3, O=4, CB=5, other=6
+  atom_labels:
+    CA: 1
+    N: 2
+    C: 3
+    O: 4
+    CB: 5
+    OTHER: 6
+  # 氨基酸类型标签 (1-20)
+  aa_labels:
+    ALA: 1
+    ARG: 2
+    ASN: 3
+    ASP: 4
+    CYS: 5
+    GLN: 6
+    GLU: 7
+    GLY: 8
+    HIS: 9
+    ILE: 10
+    LEU: 11
+    LYS: 12
+    MET: 13
+    PHE: 14
+    PRO: 15
+    SER: 16
+    THR: 17
+    TRP: 18
+    TYR: 19
+    VAL: 20
+  # 二级结构标签: coil=1, helix=2, strand=3
+  ss_labels:
+    coil: 1
+    helix: 2
+    strand: 3
+  # 标注距离阈值 (Å)
+  distance_threshold: 3.0
+
+# 增强标注配置
+enhancement:
+  sim_b_factor: 100.0   # 模拟B因子
+  sim_resolution: 2.0   # 模拟分辨率 (Å)
+
+# 去冗余配置
+redundancy:
+  sequence_identity: 0.7  # 序列相似度阈值 (70%)
+
+# 路径配置
+paths:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  output_dir: "data/output"

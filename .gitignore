@@ -1,0 +1,25 @@
+# 数据文件（太大不上传）
+data/raw/
+data/processed/
+data/output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+
+# 日志
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 原始文档（二进制 docx）
+*.docx
