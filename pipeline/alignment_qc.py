@@ -4,6 +4,7 @@
 功能：
 - 验证原子模型与密度图的坐标系对齐
 - 使用 gemmi 进行坐标插值（确保坐标系正确）
+- 使用三线性插值放置原子生成高精度模拟密度图
 - 计算 map-model 拟合质量指标（CC_mask 等）
 - 根据质量阈值过滤低质量数据
 """
@@ -17,13 +18,21 @@ from scipy.stats import pearsonr
 
 logger = logging.getLogger(__name__)
 
+# 元素散射权重（归一化到碳=1.0）
+ELEMENT_WEIGHT = {
+    'C': 1.0, 'N': 1.17, 'O': 1.33, 'S': 2.67, 'P': 2.5,
+    'H': 0.17, 'FE': 4.33, 'ZN': 5.0, 'MG': 2.0, 'CA': 3.33,
+    'NA': 1.83, 'CL': 2.83, 'MN': 4.17, 'CO': 4.5, 'CU': 4.83,
+}
+
 
 class AlignmentQC:
     """对齐验证与质量控制"""
 
     def __init__(self, config):
         self.config = config
-        self.sim_resolution = config['alignment_qc']['sim_resolution']
+        self.sim_sigma = config['alignment_qc'].get('sim_sigma', 0.8)
+        self.mask_threshold = config['alignment_qc'].get('mask_threshold', 0.05)
         self.cc_threshold = config['alignment_qc']['cc_threshold']
 
     def load_structure(self, cif_path):
@@ -53,26 +62,19 @@ class AlignmentQC:
                     })
         return atoms
 
-    def compute_cc_at_atoms(self, grid, structure, radius=2.0):
+    def compute_cc_at_atoms(self, grid, structure):
         """
-        计算原子位置处的密度相关性（使用 gemmi 插值）
-
-        更可靠的 CC 计算方法：直接在原子位置采样密度值，
-        与理论值（1.0 对于有原子的位置）比较
+        在 CA 原子位置采样密度并统计诊断信息
 
         参数:
             grid: gemmi Grid 对象（归一化后的密度图）
             structure: gemmi Structure 对象
-            radius: 采样半径 (Å)
         返回:
-            cc_value, 诊断信息
+            quality_score (正值密度比例), 诊断信息
         """
         model = structure[0]
-        exp_values = []  # 实验密度值（在原子位置）
-        bg_values = []   # 背景密度值
+        exp_values = []
 
-        # 在 CA 原子位置采样实验密度
-        ca_coords = []
         for chain in model:
             for residue in chain:
                 if residue.name == "HOH":
@@ -81,14 +83,12 @@ class AlignmentQC:
                 if ca:
                     val = grid.interpolate_value(ca.pos)
                     exp_values.append(val)
-                    ca_coords.append(ca.pos)
 
         exp_values = np.array(exp_values)
 
         if len(exp_values) == 0:
             return 0.0, {"n_ca": 0}
 
-        # 统计诊断信息
         info = {
             "n_ca": len(exp_values),
             "density_mean_at_ca": float(exp_values.mean()),
@@ -101,77 +101,105 @@ class AlignmentQC:
                     f"median={info['density_median_at_ca']:.4f}, "
                     f">0 比例={info['density_positive_ratio']*100:.1f}%")
 
-        # 生成模拟密度图并计算 CC
-        # 方法：在同一组位置采样模拟密度和实验密度
-        # 模拟密度：CA 位置 = 1.0，远离原子 = 0.0
-        sim_values = np.ones(len(exp_values))  # CA 位置的理论密度
-
-        # CC 只在有信号的区域计算
-        if exp_values.std() == 0:
-            return 0.0, info
-
-        cc, _ = pearsonr(exp_values, sim_values)
-        # 这个 CC 不太有意义因为 sim_values 全是 1
-        # 改用: 正值密度比例作为质量指标
-        quality_score = (exp_values > 0).mean()
-        info["quality_score"] = float(quality_score)
+        quality_score = float((exp_values > 0).mean())
+        info["quality_score"] = quality_score
 
         return quality_score, info
 
-    def generate_simulated_map(self, grid, structure, resolution=None):
+    def _place_atoms_trilinear(self, model, cell, nu, nv, nw):
         """
-        从原子模型生成模拟密度图（使用 gemmi 坐标系）
+        三线性插值放置原子到 grid 上（保留亚体素精度）
 
-        参数:
-            grid: 参考 gemmi Grid（用于确定网格大小和坐标系）
-            structure: gemmi Structure
-            resolution: 模拟分辨率 (Å)
-        返回:
-            sim_grid: gemmi FloatGrid（模拟密度图）
+        将每个原子的权重分配到最近的 8 个体素，
+        按距离加权，避免四舍五入到最近体素的精度损失
         """
-        if resolution is None:
-            resolution = self.sim_resolution
+        sim = np.zeros((nu, nv, nw), dtype=np.float32)
 
-        # 创建与输入 grid 同形状的模拟 grid
-        sim_grid = gemmi.FloatGrid(grid.nu, grid.nv, grid.nw)
-        sim_grid.set_unit_cell(grid.unit_cell)
-        sim_grid.spacegroup = grid.spacegroup
-        sim_data = np.array(sim_grid, copy=False)
-
-        model = structure[0]
-        n_atoms = 0
         for chain in model:
             for residue in chain:
                 if residue.name == "HOH":
                     continue
                 for atom in residue:
-                    # 将原子坐标转换为 grid 索引
-                    frac = grid.unit_cell.fractionalize(atom.pos)
-                    i = int(round(frac.x * grid.nu)) % grid.nu
-                    j = int(round(frac.y * grid.nv)) % grid.nv
-                    k = int(round(frac.z * grid.nw)) % grid.nw
-                    sim_data[i, j, k] += 1.0
-                    n_atoms += 1
+                    frac = cell.fractionalize(atom.pos)
+                    # 连续坐标
+                    fi = frac.x * nu
+                    fj = frac.y * nv
+                    fk = frac.z * nw
+                    # 下界索引
+                    i0 = int(np.floor(fi)) % nu
+                    j0 = int(np.floor(fj)) % nv
+                    k0 = int(np.floor(fk)) % nw
+                    i1 = (i0 + 1) % nu
+                    j1 = (j0 + 1) % nv
+                    k1 = (k0 + 1) % nw
+                    # 小数部分
+                    di = fi - np.floor(fi)
+                    dj = fj - np.floor(fj)
+                    dk = fk - np.floor(fk)
+                    # 元素权重
+                    w = ELEMENT_WEIGHT.get(atom.element.name, 1.0)
+                    # 分配到 8 个相邻体素
+                    sim[i0, j0, k0] += w * (1-di) * (1-dj) * (1-dk)
+                    sim[i1, j0, k0] += w * di     * (1-dj) * (1-dk)
+                    sim[i0, j1, k0] += w * (1-di) * dj     * (1-dk)
+                    sim[i0, j0, k1] += w * (1-di) * (1-dj) * dk
+                    sim[i1, j1, k0] += w * di     * dj     * (1-dk)
+                    sim[i1, j0, k1] += w * di     * (1-dj) * dk
+                    sim[i0, j1, k1] += w * (1-di) * dj     * dk
+                    sim[i1, j1, k1] += w * di     * dj     * dk
 
-        logger.info(f"  放置了 {n_atoms} 个原子到模拟密度图")
+        return sim
+
+    def generate_simulated_map(self, grid, structure, sigma_A=None):
+        """
+        从原子模型生成模拟密度图
+
+        使用三线性插值放置原子 + 高斯模糊模拟电子密度
+        """
+        if sigma_A is None:
+            sigma_A = self.sim_sigma
+
+        cell = grid.unit_cell
+        nu, nv, nw = grid.nu, grid.nv, grid.nw
+        model = structure[0]
+
+        # 三线性插值放置原子
+        sim_data = self._place_atoms_trilinear(model, cell, nu, nv, nw)
+        n_atoms = sum(
+            1 for chain in model for res in chain
+            if res.name != "HOH" for _ in res
+        )
+        logger.info(f"  放置了 {n_atoms} 个原子（三线性插值）")
 
         # 高斯模糊
-        sigma_A = resolution / (2.0 * np.sqrt(2.0 * np.log(2.0)))
         sigma_voxels = sigma_A / grid.spacing[0]
-        sim_data_blurred = gaussian_filter(sim_data, sigma=sigma_voxels)
+        sim_data = gaussian_filter(sim_data, sigma=sigma_voxels)
 
-        if sim_data_blurred.max() > 0:
-            sim_data_blurred /= sim_data_blurred.max()
+        if sim_data.max() > 0:
+            sim_data /= sim_data.max()
 
-        sim_data[:] = sim_data_blurred
+        # 包装为 gemmi grid
+        sim_grid = gemmi.FloatGrid(nu, nv, nw)
+        sim_grid.set_unit_cell(cell)
+        sim_grid.spacegroup = grid.spacegroup
+        arr = np.array(sim_grid, copy=False)
+        arr[:] = sim_data
+
         return sim_grid
 
-    def compute_cc_mask(self, exp_grid, sim_grid):
-        """计算 masked CC (在模拟密度>0的区域)"""
+    def compute_cc_mask(self, exp_grid, sim_grid, mask_threshold=None):
+        """
+        计算 masked CC
+
+        mask 为模拟密度图中信号强度超过阈值的区域
+        """
+        if mask_threshold is None:
+            mask_threshold = self.mask_threshold
+
         exp_data = np.array(exp_grid, copy=True)
         sim_data = np.array(sim_grid, copy=True)
 
-        mask = sim_data > 0.01
+        mask = sim_data > mask_threshold
         if mask.sum() == 0:
             return 0.0
 
@@ -193,7 +221,7 @@ class AlignmentQC:
             logger.warning(f"跳过 {entry_dir}: 缺少文件")
             return None
 
-        # 使用 gemmi 加载密度图
+        # 加载密度图
         ccp4 = gemmi.read_ccp4_map(map_path)
         ccp4.setup(float('nan'))
         grid = ccp4.grid
@@ -206,11 +234,11 @@ class AlignmentQC:
         atoms = self.get_atom_coords(structure)
         logger.info(f"  加载了 {len(atoms)} 个原子")
 
-        # 在原子位置采样密度并评估
+        # 在原子位置采样密度
         quality_score, diag_info = self.compute_cc_at_atoms(grid, structure)
         logger.info(f"  质量分数 (正密度比例): {quality_score:.4f}")
 
-        # 生成模拟密度图
+        # 生成模拟密度图（三线性 + 高斯模糊）
         sim_grid = self.generate_simulated_map(grid, structure)
 
         # 计算 CC_mask
@@ -227,7 +255,7 @@ class AlignmentQC:
             "quality_score": float(quality_score),
             "n_atoms": len(atoms),
             "grid_shape": [grid.nu, grid.nv, grid.nw],
-            "spacing": [float(grid.spacing[0]), float(grid.spacing[1]), float(grid.spacing[2])],
+            "spacing": [float(s) for s in grid.spacing],
             "passed": bool(passed),
             "quality": quality,
             "diagnostics": diag_info,
@@ -259,10 +287,7 @@ class AlignmentQC:
                 metrics = self.evaluate_entry(entry_dir)
                 if metrics is None:
                     continue
-
-                result = {"entry_dir": entry_dir, "metrics": metrics}
-                results.append(result)
-
+                results.append({"entry_dir": entry_dir, "metrics": metrics})
                 if metrics["passed"]:
                     passed.append(entry_dir)
                 else:

@@ -50,20 +50,33 @@ class EnhancementLabeler:
         mol_data = np.zeros((nu, nv, nw), dtype=np.float32)
         n_atoms = 0
 
+        # 三线性插值放置原子（保留亚体素精度）
         for chain in model:
             for residue in chain:
                 if residue.name == "HOH":
                     continue
                 for atom in residue:
                     frac = cell.fractionalize(atom.pos)
-                    i = int(round(frac.x * nu)) % nu
-                    j = int(round(frac.y * nv)) % nv
-                    k = int(round(frac.z * nw)) % nw
-                    weight = element_weight.get(atom.element.name, 1.0)
-                    mol_data[i, j, k] += weight
+                    fi, fj, fk = frac.x * nu, frac.y * nv, frac.z * nw
+                    i0 = int(np.floor(fi)) % nu
+                    j0 = int(np.floor(fj)) % nv
+                    k0 = int(np.floor(fk)) % nw
+                    i1, j1, k1 = (i0+1)%nu, (j0+1)%nv, (k0+1)%nw
+                    di = fi - np.floor(fi)
+                    dj = fj - np.floor(fj)
+                    dk = fk - np.floor(fk)
+                    w = element_weight.get(atom.element.name, 1.0)
+                    mol_data[i0,j0,k0] += w*(1-di)*(1-dj)*(1-dk)
+                    mol_data[i1,j0,k0] += w*di*(1-dj)*(1-dk)
+                    mol_data[i0,j1,k0] += w*(1-di)*dj*(1-dk)
+                    mol_data[i0,j0,k1] += w*(1-di)*(1-dj)*dk
+                    mol_data[i1,j1,k0] += w*di*dj*(1-dk)
+                    mol_data[i1,j0,k1] += w*di*(1-dj)*dk
+                    mol_data[i0,j1,k1] += w*(1-di)*dj*dk
+                    mol_data[i1,j1,k1] += w*di*dj*dk
                     n_atoms += 1
 
-        logger.info(f"  放置了 {n_atoms} 个原子")
+        logger.info(f"  放置了 {n_atoms} 个原子（三线性插值）")
 
         # 高斯模糊
         sigma_A = np.sqrt(self.b_factor / (8 * np.pi**2))

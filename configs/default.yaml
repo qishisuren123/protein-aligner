@@ -28,12 +28,10 @@ normalization:
 # 对齐与质量控制配置
 alignment_qc:
   # 模拟密度图参数
-  sim_resolution: 3.0   # 模拟密度图分辨率 (Å)
+  sim_sigma: 0.8          # 高斯模糊 sigma (Å)，控制模拟密度的宽度
+  mask_threshold: 0.05    # CC 计算时的 mask 阈值
   # 质量阈值
-  cc_threshold: 0.5     # CC_mask 最低阈值
-  # 对齐搜索参数
-  search_range: 5.0     # 搜索范围 (Å)
-  search_step: 1.0      # 搜索步长 (Å)
+  cc_threshold: 0.3       # CC_mask 最低阈值
 
 # 对应标注配置
 correspondence:
