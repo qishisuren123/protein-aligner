@@ -106,6 +106,12 @@ class EnhancementLabeler:
         dc.put_model_density_on_grid(model)
         mol_data = np.array(dc.grid, copy=True)
 
+        # 清除 NaN（DCX 偶尔产生极少量 NaN，会在 zoom 插值时传播）
+        nan_count = np.isnan(mol_data).sum()
+        if nan_count > 0:
+            logger.info(f"  清除 {nan_count} 个 NaN 值")
+            mol_data = np.nan_to_num(mol_data, nan=0.0)
+
         # DensityCalculatorX 可能自动调整 grid 尺寸，需要重采样
         target_shape = (nu, nv, nw)
         if mol_data.shape != target_shape:

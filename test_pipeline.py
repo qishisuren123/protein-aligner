@@ -45,11 +45,11 @@ TEST_ENTRIES = [
     {"pdb_id": "7EFC", "emdb_id": "EMD-31083", "resolution": 1.70,
      "type": "protein", "desc": "蛋白质"},
     # 蛋白质-RNA 复合物
-    {"pdb_id": "9K6S", "emdb_id": "EMD-48045", "resolution": 2.80,
+    {"pdb_id": "9K6S", "emdb_id": "EMD-62134", "resolution": 2.80,
      "type": "protein-RNA", "desc": "蛋白-RNA 复合物"},
     # 糖蛋白（含 NAG 等糖基修饰）
-    {"pdb_id": "8HKS", "emdb_id": "EMD-34948", "resolution": 2.90,
-     "type": "glycoprotein", "desc": "糖蛋白 (Spike-NAG)"},
+    {"pdb_id": "8XPS", "emdb_id": "EMD-38560", "resolution": 3.22,
+     "type": "glycoprotein", "desc": "糖蛋白"},
 ]
 
 
@@ -169,7 +169,7 @@ def main():
         logger.info(f"    分子类型(体素): {moltype_vox}")
 
         # RNA 条目应包含 RNA 类型体素
-        if "48045" in entry_name:
+        if "62134" in entry_name:
             rna_voxels = moltype_vox.get('RNA', 0)
             if rna_voxels > 0:
                 logger.info(f"    [PASS] RNA 体素 = {rna_voxels}")
@@ -185,7 +185,7 @@ def main():
                             f"label_moltype.mrc 包含 RNA(2): {has_rna}")
 
         # 糖蛋白条目应包含 sugar 类型体素
-        if "34948" in entry_name:
+        if "38560" in entry_name:
             sugar_voxels = moltype_vox.get('sugar', 0)
             if sugar_voxels > 0:
                 logger.info(f"    [PASS] Sugar 体素 = {sugar_voxels}")

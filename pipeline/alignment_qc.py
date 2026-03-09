@@ -156,6 +156,12 @@ class AlignmentQC:
         # 提取数据（DensityCalculatorX 可能自动调整 grid 尺寸）
         sim_data = np.array(dc.grid, copy=True)
 
+        # 清除 NaN（DCX 偶尔产生极少量 NaN，会在 zoom 插值时传播）
+        nan_count = np.isnan(sim_data).sum()
+        if nan_count > 0:
+            logger.info(f"  清除 {nan_count} 个 NaN 值")
+            sim_data = np.nan_to_num(sim_data, nan=0.0)
+
         # 如果 DC 自动调整了 grid 尺寸，需要重采样到目标尺寸
         target_shape = (grid.nu, grid.nv, grid.nw)
         if sim_data.shape != target_shape:
