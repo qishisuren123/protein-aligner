@@ -21,5 +21,8 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# 外部工具（自动下载的二进制）
+tools/
+
 # 原始文档（二进制 docx）
 *.docx

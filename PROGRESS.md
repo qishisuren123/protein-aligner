@@ -46,8 +46,8 @@
    - 输出: `data/output/dataset_overview.png`
 
 7. **测试扩展** (`test_pipeline.py`)
-   - 新增 protein-RNA 复合物: 9K6S / EMD-48045 (2.8Å)
-   - 新增糖蛋白: 8HKS / EMD-34948 (2.9Å)
+   - 新增 protein-RNA 复合物: 9K6S / EMD-62134 (2.8Å)
+   - 新增糖蛋白: 8XPS / EMD-38560 (3.22Å)
    - label_moltype 验证：RNA 体素、sugar 体素断言
    - Q-score 输出验证
 
