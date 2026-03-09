@@ -27,6 +27,7 @@ class EnhancementLabeler:
         enh_cfg = config['enhancement']
         self.b_factor = enh_cfg.get('sim_b_factor', 100.0)
         self.resolution = enh_cfg.get('sim_resolution', 2.0)
+        self.adaptive_blur = enh_cfg.get('adaptive_blur', False)
         # 生物组装体配置
         bio_cfg = config.get('bio_assembly', {})
         self.bio_assembly_enabled = bio_cfg.get('enabled', True)
@@ -87,9 +88,17 @@ class EnhancementLabeler:
 
         # 使用 DensityCalculatorX 生成密度
         # blur = b_factor 来控制模拟密度的平滑度
+        # 自适应模式：按分辨率缩放，高分辨率保留更多细节
+        if self.adaptive_blur:
+            blur = self.b_factor * (resolution / 2.0)
+            logger.info(f"  自适应 blur: base={self.b_factor}, "
+                        f"resolution={resolution:.2f}Å, blur={blur:.1f}")
+        else:
+            blur = self.b_factor
+
         dc = gemmi.DensityCalculatorX()
         dc.d_min = resolution
-        dc.blur = self.b_factor
+        dc.blur = blur
         dc.grid.set_unit_cell(cell)
         dc.grid.set_size(nu, nv, nw)
         dc.grid.spacegroup = ref_grid.spacegroup
@@ -105,7 +114,7 @@ class EnhancementLabeler:
             mol_data = zoom(mol_data, zoom_factors, order=3)
 
         logger.info(f"  DensityCalculatorX: {n_atoms} 原子, "
-                    f"resolution={resolution:.2f}Å, blur={self.b_factor}")
+                    f"resolution={resolution:.2f}Å, blur={blur:.1f}")
 
         # 归一化
         if mol_data.max() > 0:

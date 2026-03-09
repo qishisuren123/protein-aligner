@@ -17,6 +17,7 @@ from scipy.stats import pearsonr
 from scipy.ndimage import zoom
 
 from pipeline.bio_assembly import expand_to_assembly
+from pipeline.qscore import compute_qscore_per_atom, compute_qscore_summary
 
 logger = logging.getLogger(__name__)
 
@@ -334,6 +335,23 @@ class AlignmentQC:
         sim_ccp4.grid = sim_grid
         sim_ccp4.update_ccp4_header()
         sim_ccp4.write_ccp4_map(sim_path)
+
+        # 计算 Q-score（原子级密度拟合置信度）
+        try:
+            qscore_cfg = self.config.get('qscore', {})
+            qscores, _ = compute_qscore_per_atom(
+                grid, structure,
+                sigma=qscore_cfg.get('sigma', 0.6),
+                n_directions=qscore_cfg.get('n_directions', 40),
+                max_radius=qscore_cfg.get('max_radius', 2.0),
+                step_size=qscore_cfg.get('step_size', 0.1),
+            )
+            qscore_summary = compute_qscore_summary(qscores)
+            metrics.update(qscore_summary)
+            logger.info(f"  Q-score: mean={qscore_summary['q_score_mean']:.3f}, "
+                        f"median={qscore_summary['q_score_median']:.3f}")
+        except Exception as e:
+            logger.warning(f"  Q-score 计算失败: {e}")
 
         # 保存质量指标
         qc_path = os.path.join(entry_dir, "qc_metrics.json")

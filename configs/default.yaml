@@ -1,4 +1,4 @@
-# Cryo-EM 数据处理管线默认配置
+# Cryo-EM 数据处理管线默认配置 (V2)
 
 # 数据检索配置
 retrieval:
@@ -43,6 +43,13 @@ alignment_qc:
   # 质量阈值
   cc_threshold: 0.3       # CC_mask 最低通过阈值
 
+# Q-score 配置 (Pintilie et al., 2020)
+qscore:
+  sigma: 0.6              # 参考高斯宽度 (Å)
+  n_directions: 40        # Fibonacci sphere 采样方向数
+  max_radius: 2.0         # 最大采样半径 (Å)
+  step_size: 0.1          # 径向距离步长 (Å)
+
 # 对应标注配置
 correspondence:
   # 原子类型标签: CA=1, N=2, C=3, O=4, CB=5, other=6
@@ -75,25 +82,48 @@ correspondence:
     TRP: 18
     TYR: 19
     VAL: 20
-  # 二级结构标签: coil=1, helix=2, strand=3
+  # 核苷酸标签 (21-28): A=21, U=22, G=23, C=24, DA=25, DT=26, DG=27, DC=28
+  # 糖基标签 (29-34): NAG=29, MAN=30, BMA=31, FUC=32, GAL=33, SIA=34
+  # 二级结构标签: coil=1, helix=2, strand=3, sugar_phosphate=4, base=5
   ss_labels:
     coil: 1
     helix: 2
     strand: 3
+    sugar_phosphate: 4
+    base: 5
   # 标注距离阈值 (Å)
   distance_threshold: 3.0
   # Voronoi 全覆盖标注
   use_voronoi: true                # 启用 Voronoi 标注（距离阈值外的体素）
   voronoi_max_confidence: 0.3      # Voronoi 标注的最大置信度
+  # 多分子类型标注
+  molecule_types:
+    enabled: true
+    sugar_residues: [NAG, MAN, BMA, FUC, GAL, SIA, BGC, GLC, NDG, XYS]
+  # 是否用 Q-score 替换高斯衰减置信度（实验性）
+  use_qscore_confidence: false
 
 # 增强标注配置
 enhancement:
-  sim_b_factor: 100.0   # 模拟B因子（控制密度平滑程度）
-  sim_resolution: 2.0   # 模拟分辨率 (Å)
+  sim_b_factor: 100.0     # 模拟B因子（控制密度平滑程度）
+  sim_resolution: 2.0     # 模拟分辨率 (Å)
+  adaptive_blur: true     # 按分辨率缩放 blur: blur = b_factor * (resolution / 2.0)
 
 # 去冗余配置
 redundancy:
-  sequence_identity: 0.7  # 序列相似度阈值 (70%)
+  sequence_identity: 0.7    # 序列相似度阈值 (70%)
+  use_mmseqs2: true         # 启用 MMseqs2 精确聚类（不可用时自动回退 3-mer Jaccard）
+  mmseqs2_identity: 0.3     # MMseqs2 聚类序列一致性阈值
+  mmseqs2_binary: "tools/mmseqs"  # MMseqs2 二进制路径
+  # 数据质量分层
+  tiers:
+    gold:
+      max_resolution: 2.5   # Å
+      min_cc_mask: 0.7
+      min_qscore: 0.5
+    silver:
+      max_resolution: 3.5
+      min_cc_mask: 0.5
 
 # 路径配置
 paths:

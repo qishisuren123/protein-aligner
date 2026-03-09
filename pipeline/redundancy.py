@@ -2,7 +2,8 @@
 模块7: Remove Redundancy & Packaging - 去冗余与打包
 
 功能：
-- 从蛋白质序列角度进行去冗余（基于序列相似度聚类）
+- 从蛋白质序列角度进行去冗余（支持 MMseqs2 精确聚类或 3-mer Jaccard 近似聚类）
+- Gold/Silver/Hard 数据质量分层
 - 划分 train/val/test 集（按聚类划分防止数据泄露）
 - 生成数据集统计报告
 - 打包成可分发的数据集格式
@@ -11,7 +12,10 @@ import os
 import json
 import logging
 import shutil
-import hashlib
+import subprocess
+import tempfile
+import stat
+import urllib.request
 from collections import defaultdict
 
 import numpy as np
@@ -25,7 +29,15 @@ class RedundancyRemover:
 
     def __init__(self, config):
         self.config = config
-        self.seq_identity = config['redundancy']['sequence_identity']
+        red_cfg = config['redundancy']
+        self.seq_identity = red_cfg.get('sequence_identity', 0.7)
+        self.use_mmseqs2 = red_cfg.get('use_mmseqs2', False)
+        self.mmseqs2_identity = red_cfg.get('mmseqs2_identity', 0.3)
+        self.mmseqs2_binary = red_cfg.get('mmseqs2_binary', 'tools/mmseqs')
+        # 数据分层配置
+        self.tier_cfg = red_cfg.get('tiers', {})
+
+    # ===== 序列提取 =====
 
     def extract_sequences(self, entry_dirs):
         """
@@ -63,12 +75,14 @@ class RedundancyRemover:
 
         return sequences
 
+    # ===== 3-mer Jaccard 聚类（原有方法） =====
+
     def simple_sequence_clustering(self, sequences):
         """
         简化的序列聚类（基于序列相似度）
 
-        由于没有 MMseqs2，使用简化的基于序列长度和组成的聚类
-        实际生产环境应使用 MMseqs2 进行精确聚类
+        使用 3-mer Jaccard 相似系数做近似聚类。
+        MMseqs2 不可用时的回退方案。
 
         返回:
             clusters: {cluster_id: [entry_dir, ...]}
@@ -111,7 +125,7 @@ class RedundancyRemover:
             clusters[cluster_id] = cluster
             cluster_id += 1
 
-        logger.info(f"序列聚类: {len(entries)} 条目 -> {len(clusters)} 簇")
+        logger.info(f"序列聚类 (3-mer Jaccard): {len(entries)} 条目 -> {len(clusters)} 簇")
         return clusters
 
     def _estimate_similarity(self, seq1, seq2):
@@ -137,6 +151,183 @@ class RedundancyRemover:
         intersection = len(kmers1 & kmers2)
         union = len(kmers1 | kmers2)
         return intersection / union
+
+    # ===== MMseqs2 精确聚类 =====
+
+    def _download_mmseqs2(self):
+        """
+        下载 MMseqs2 静态二进制（Linux x86_64）
+
+        返回:
+            binary_path: 下载后的可执行文件路径，失败返回 None
+        """
+        binary_path = os.path.abspath(self.mmseqs2_binary)
+        if os.path.exists(binary_path) and os.access(binary_path, os.X_OK):
+            logger.info(f"  MMseqs2 已存在: {binary_path}")
+            return binary_path
+
+        url = ("https://mmseqs.com/latest/mmseqs-linux-avx2.tar.gz")
+        os.makedirs(os.path.dirname(binary_path) or '.', exist_ok=True)
+
+        try:
+            logger.info(f"  下载 MMseqs2 静态二进制...")
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tarball = os.path.join(tmpdir, "mmseqs.tar.gz")
+                urllib.request.urlretrieve(url, tarball)
+                # 解压
+                import tarfile
+                with tarfile.open(tarball, 'r:gz') as tf:
+                    tf.extractall(tmpdir)
+                # 找到 mmseqs 可执行文件
+                extracted = os.path.join(tmpdir, "mmseqs", "bin", "mmseqs")
+                if not os.path.exists(extracted):
+                    logger.warning(f"  解压后未找到 mmseqs 二进制")
+                    return None
+                shutil.copy2(extracted, binary_path)
+                os.chmod(binary_path, os.stat(binary_path).st_mode | stat.S_IEXEC)
+            logger.info(f"  MMseqs2 下载完成: {binary_path}")
+            return binary_path
+        except Exception as e:
+            logger.warning(f"  MMseqs2 下载失败: {e}")
+            return None
+
+    def _run_mmseqs2(self, sequences):
+        """
+        使用 MMseqs2 进行序列聚类
+
+        参数:
+            sequences: {entry_dir: {chain_id: sequence}}
+        返回:
+            clusters: {cluster_id: [entry_dir, ...]}，失败返回 None
+        """
+        binary_path = self._download_mmseqs2()
+        if binary_path is None:
+            return None
+
+        # 准备代表序列（取每个条目最长链）
+        representatives = {}
+        for entry_dir, chain_seqs in sequences.items():
+            if chain_seqs:
+                rep_seq = max(chain_seqs.values(), key=len)
+                representatives[entry_dir] = rep_seq
+
+        if len(representatives) < 2:
+            # 只有一个条目，直接返回单簇
+            return {0: list(representatives.keys())}
+
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # 写入 FASTA
+                fasta_path = os.path.join(tmpdir, "seqs.fasta")
+                entry_order = []
+                with open(fasta_path, 'w') as f:
+                    for i, (entry_dir, seq) in enumerate(representatives.items()):
+                        name = os.path.basename(entry_dir)
+                        f.write(f">{name}\n{seq}\n")
+                        entry_order.append(entry_dir)
+
+                # 运行 mmseqs easy-cluster
+                result_prefix = os.path.join(tmpdir, "result")
+                mmseqs_tmp = os.path.join(tmpdir, "tmp")
+                cmd = [
+                    binary_path, "easy-cluster",
+                    fasta_path, result_prefix, mmseqs_tmp,
+                    "--min-seq-id", str(self.mmseqs2_identity),
+                    "-c", "0.8",
+                    "--cov-mode", "0",
+                ]
+                logger.info(f"  运行 MMseqs2: identity={self.mmseqs2_identity}")
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+                if proc.returncode != 0:
+                    logger.warning(f"  MMseqs2 运行失败: {proc.stderr[:500]}")
+                    return None
+
+                # 解析聚类结果: result_prefix_cluster.tsv
+                cluster_tsv = result_prefix + "_cluster.tsv"
+                if not os.path.exists(cluster_tsv):
+                    logger.warning(f"  MMseqs2 聚类结果文件不存在")
+                    return None
+
+                # TSV 格式: representative_name \t member_name
+                name_to_dir = {os.path.basename(d): d for d in entry_order}
+                cluster_map = {}  # rep_name -> [entry_dirs]
+                with open(cluster_tsv) as f:
+                    for line in f:
+                        parts = line.strip().split('\t')
+                        if len(parts) < 2:
+                            continue
+                        rep, member = parts[0], parts[1]
+                        if rep not in cluster_map:
+                            cluster_map[rep] = []
+                        member_dir = name_to_dir.get(member)
+                        if member_dir:
+                            cluster_map[rep].append(member_dir)
+
+                # 转换为 {cluster_id: [entry_dirs]}
+                clusters = {}
+                for i, (rep, members) in enumerate(cluster_map.items()):
+                    clusters[i] = members
+
+                logger.info(f"序列聚类 (MMseqs2): {len(representatives)} 条目 -> {len(clusters)} 簇")
+                return clusters
+
+        except Exception as e:
+            logger.warning(f"  MMseqs2 聚类失败: {e}")
+            return None
+
+    def mmseqs2_clustering(self, sequences):
+        """
+        MMseqs2 聚类入口，失败时自动回退到 3-mer Jaccard
+
+        返回:
+            clusters: {cluster_id: [entry_dir, ...]}
+        """
+        clusters = self._run_mmseqs2(sequences)
+        if clusters is not None:
+            return clusters
+        logger.info("  MMseqs2 不可用，回退到 3-mer Jaccard 聚类")
+        return self.simple_sequence_clustering(sequences)
+
+    # ===== 数据分层 =====
+
+    def classify_tier(self, entry_dir):
+        """
+        根据数据质量将条目分为 Gold/Silver/Hard 三级
+
+        Gold:   resolution < 2.5Å AND cc_mask > 0.7 AND q_score_mean > 0.5
+        Silver: resolution < 3.5Å AND cc_mask > 0.5
+        Hard:   其余通过 QC 的条目
+        """
+        qc_path = os.path.join(entry_dir, "qc_metrics.json")
+        if not os.path.exists(qc_path):
+            return "hard"
+
+        with open(qc_path) as f:
+            qc = json.load(f)
+
+        resolution = qc.get("resolution", 99.0)
+        cc_mask = qc.get("cc_mask", 0.0)
+        q_score_mean = qc.get("q_score_mean", 0.0)
+
+        # 可配置阈值
+        gold_cfg = self.tier_cfg.get('gold', {})
+        silver_cfg = self.tier_cfg.get('silver', {})
+
+        gold_res = gold_cfg.get('max_resolution', 2.5)
+        gold_cc = gold_cfg.get('min_cc_mask', 0.7)
+        gold_qs = gold_cfg.get('min_qscore', 0.5)
+
+        silver_res = silver_cfg.get('max_resolution', 3.5)
+        silver_cc = silver_cfg.get('min_cc_mask', 0.5)
+
+        if resolution < gold_res and cc_mask > gold_cc and q_score_mean > gold_qs:
+            return "gold"
+        elif resolution < silver_res and cc_mask > silver_cc:
+            return "silver"
+        else:
+            return "hard"
+
+    # ===== 数据集划分 =====
 
     def split_dataset(self, clusters, train_ratio=0.8, val_ratio=0.1, test_ratio=0.1):
         """
@@ -172,13 +363,28 @@ class RedundancyRemover:
                     f"val={len(splits['val'])}, test={len(splits['test'])}")
         return splits
 
+    # ===== 报告生成 =====
+
     def generate_report(self, entry_dirs, clusters, splits, output_dir):
-        """生成数据集统计报告"""
+        """生成数据集统计报告（含 tier 分层信息）"""
+        # 数据分层统计
+        tier_counts = {"gold": 0, "silver": 0, "hard": 0}
+        tier_map = {}
+
+        for entry_dir in entry_dirs:
+            tier = self.classify_tier(entry_dir)
+            tier_map[entry_dir] = tier
+            tier_counts[tier] += 1
+
+        logger.info(f"数据分层: gold={tier_counts['gold']}, "
+                    f"silver={tier_counts['silver']}, hard={tier_counts['hard']}")
+
         report = {
             "total_entries": len(entry_dirs),
             "n_clusters": len(clusters),
             "splits": {k: len(v) for k, v in splits.items()},
             "sequence_identity_threshold": self.seq_identity,
+            "tiers": tier_counts,
             "entries": {}
         }
 
@@ -188,7 +394,7 @@ class RedundancyRemover:
             label_path = os.path.join(entry_dir, "labeling_stats.json")
             meta_path = os.path.join(entry_dir, "metadata.json")
 
-            entry_info = {"dir": entry_dir}
+            entry_info = {"dir": entry_dir, "tier": tier_map.get(entry_dir, "hard")}
             for path, key in [(qc_path, "qc"), (label_path, "labeling"), (meta_path, "metadata")]:
                 if os.path.exists(path):
                     with open(path) as f:
@@ -218,6 +424,8 @@ class RedundancyRemover:
         logger.info(f"数据集报告已保存: {report_path}")
         return report
 
+    # ===== 打包 =====
+
     def package_dataset(self, splits, output_dir):
         """
         将数据集打包成标准格式
@@ -237,12 +445,12 @@ class RedundancyRemover:
         """
         os.makedirs(output_dir, exist_ok=True)
 
-        # 需要打包的文件列表
+        # 需要打包的文件列表（新增 label_moltype.mrc）
         files_to_copy = [
             "map_normalized.mrc", "model.cif", "raw_map.map",
             "sim_map.mrc", "mol_map.mrc",
             "label_atom.mrc", "label_aa.mrc", "label_ss.mrc",
-            "label_chain.mrc", "label_confidence.mrc",
+            "label_chain.mrc", "label_confidence.mrc", "label_moltype.mrc",
             "qc_metrics.json", "labeling_stats.json", "metadata.json"
         ]
 
@@ -268,6 +476,8 @@ class RedundancyRemover:
 
         logger.info(f"数据集打包完成: {output_dir}")
 
+    # ===== 主入口 =====
+
     def run(self, entry_dirs, output_dir=None):
         """执行完整的去冗余和打包流程"""
         if output_dir is None:
@@ -276,13 +486,16 @@ class RedundancyRemover:
         # 1. 提取序列
         sequences = self.extract_sequences(entry_dirs)
 
-        # 2. 序列聚类
-        clusters = self.simple_sequence_clustering(sequences)
+        # 2. 序列聚类（根据配置选择方法）
+        if self.use_mmseqs2:
+            clusters = self.mmseqs2_clustering(sequences)
+        else:
+            clusters = self.simple_sequence_clustering(sequences)
 
         # 3. 划分数据集
         splits = self.split_dataset(clusters)
 
-        # 4. 生成报告
+        # 4. 生成报告（含数据分层）
         self.generate_report(entry_dirs, clusters, splits, output_dir)
 
         # 5. 打包

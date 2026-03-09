@@ -6,6 +6,9 @@
 - 双层标注策略：
   - 距离阈值内: 高置信度（高斯衰减）
   - 距离阈值外: Voronoi 低置信度（最近邻赋值，上限 0.3）
+- 多分子类型标注（蛋白质、RNA、DNA、糖基、配体）
+- 核苷酸/糖基标签扩展
+- RNA/DNA 二级结构区分（sugar_phosphate/base）
 - 向量化赋值提升性能
 - 二级结构注释复制到所有扩展链
 """
@@ -20,6 +23,7 @@ from pipeline.bio_assembly import expand_to_assembly
 
 logger = logging.getLogger(__name__)
 
+# === 氨基酸标签 (1-20) ===
 STANDARD_AA = {
     'ALA': 1, 'ARG': 2, 'ASN': 3, 'ASP': 4, 'CYS': 5,
     'GLN': 6, 'GLU': 7, 'GLY': 8, 'HIS': 9, 'ILE': 10,
@@ -27,8 +31,100 @@ STANDARD_AA = {
     'SER': 16, 'THR': 17, 'TRP': 18, 'TYR': 19, 'VAL': 20
 }
 
+# === 核苷酸标签 (21-28) ===
+NUCLEOTIDE_LABELS = {
+    'A': 21, 'U': 22, 'G': 23, 'C': 24,     # RNA
+    'DA': 25, 'DT': 26, 'DG': 27, 'DC': 28,  # DNA
+}
+
+# === 糖基标签 (29-34) ===
+SUGAR_LABELS = {
+    'NAG': 29, 'MAN': 30, 'BMA': 31, 'FUC': 32, 'GAL': 33, 'SIA': 34
+}
+
+# === 统一残基/单体标签字典 ===
+RESIDUE_LABELS = {}
+RESIDUE_LABELS.update(STANDARD_AA)
+RESIDUE_LABELS.update(NUCLEOTIDE_LABELS)
+RESIDUE_LABELS.update(SUGAR_LABELS)
+
+# === 原子类型标签 ===
 ATOM_TYPES = {'CA': 1, 'N': 2, 'C': 3, 'O': 4, 'CB': 5}
-SS_LABELS = {'coil': 1, 'helix': 2, 'strand': 3}
+
+# === 二级结构标签（扩展） ===
+SS_LABELS = {
+    'coil': 1, 'helix': 2, 'strand': 3,
+    'sugar_phosphate': 4, 'base': 5  # RNA/DNA 专用
+}
+
+# === 分子类型标签 ===
+MOLTYPE_LABELS = {
+    'protein': 1, 'RNA': 2, 'DNA': 3, 'sugar': 4, 'ligand': 5
+}
+
+# 常见糖基残基集合（用于分子类型检测）
+DEFAULT_SUGAR_RESIDUES = {'NAG', 'MAN', 'BMA', 'FUC', 'GAL', 'SIA',
+                          'BGC', 'GLC', 'NDG', 'XYS'}
+
+# RNA/DNA 骨架原子名（sugar-phosphate backbone）
+_BACKBONE_ATOMS = {
+    "P", "OP1", "OP2", "OP3",
+    "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "O2'", "C1'",
+    # 部分 PDB 用无引号命名
+    "O5*", "C5*", "C4*", "O4*", "C3*", "O3*", "C2*", "O2*", "C1*",
+}
+
+
+def _detect_moltype(residue, sugar_residues=None):
+    """
+    检测残基的分子类型
+
+    使用 gemmi.find_tabulated_residue() 获取残基信息，
+    通过 info.kind (ResidueKind) 判断分子类型。
+
+    返回:
+        moltype: 'protein', 'RNA', 'DNA', 'sugar', 'ligand', 或 None（水）
+    """
+    if sugar_residues is None:
+        sugar_residues = DEFAULT_SUGAR_RESIDUES
+
+    # 水分子不标注
+    if residue.name == 'HOH':
+        return None
+
+    # 糖基残基优先检测（常见修饰糖）
+    if residue.name in sugar_residues:
+        return 'sugar'
+
+    info = gemmi.find_tabulated_residue(residue.name)
+    kind = info.kind
+
+    # 蛋白质
+    if kind == gemmi.ResidueKind.AA:
+        return 'protein'
+    # RNA
+    if kind == gemmi.ResidueKind.RNA:
+        return 'RNA'
+    # DNA
+    if kind == gemmi.ResidueKind.DNA:
+        return 'DNA'
+    # 糖（pyranose，gemmi 内置分类）
+    if kind == gemmi.ResidueKind.PYR:
+        return 'sugar'
+
+    # 其他非水小分子（ELS=配体, BUF=缓冲液 等）
+    return 'ligand'
+
+
+def _get_nucleotide_ss(atom_name):
+    """
+    RNA/DNA 原子的二级结构分类
+
+    返回 'sugar_phosphate' 或 'base'
+    """
+    if atom_name in _BACKBONE_ATOMS:
+        return 'sugar_phosphate'
+    return 'base'
 
 
 class CorrespondenceLabeler:
@@ -40,6 +136,11 @@ class CorrespondenceLabeler:
         self.distance_threshold = corr_cfg['distance_threshold']
         self.use_voronoi = corr_cfg.get('use_voronoi', True)
         self.voronoi_max_confidence = corr_cfg.get('voronoi_max_confidence', 0.3)
+        # 多分子类型配置
+        mol_cfg = corr_cfg.get('molecule_types', {})
+        self.moltype_enabled = mol_cfg.get('enabled', True)
+        self.sugar_residues = set(mol_cfg.get('sugar_residues',
+                                              list(DEFAULT_SUGAR_RESIDUES)))
         # 生物组装体配置
         bio_cfg = config.get('bio_assembly', {})
         self.bio_assembly_enabled = bio_cfg.get('enabled', True)
@@ -125,7 +226,7 @@ class CorrespondenceLabeler:
         return ss_map
 
     def _parse_structure(self, cif_path):
-        """解析结构文件，提取原子信息和二级结构"""
+        """解析结构文件，提取原子信息、二级结构和分子类型"""
         orig_st = gemmi.read_structure(cif_path)
         orig_st.setup_entities()
 
@@ -145,24 +246,49 @@ class CorrespondenceLabeler:
         model = expanded_st[0]
         atoms_info = []
         chain_ids = set()
+        # 分子类型统计
+        moltype_counts = {'protein': 0, 'RNA': 0, 'DNA': 0, 'sugar': 0, 'ligand': 0}
 
         for chain in model:
             chain_ids.add(chain.name)
             for residue in chain:
                 if residue.name == "HOH":
                     continue
+
+                # 检测分子类型
+                moltype = _detect_moltype(residue, self.sugar_residues)
+                if moltype is None:
+                    continue
+
+                # 残基标签：统一查 RESIDUE_LABELS
+                aa_type = RESIDUE_LABELS.get(residue.name, 0)
+
                 for atom in residue:
+                    # RNA/DNA 的二级结构特殊处理
+                    if moltype in ('RNA', 'DNA'):
+                        atom_ss = _get_nucleotide_ss(atom.name)
+                    else:
+                        atom_ss = None  # 用 ss_map
+
                     atoms_info.append({
                         'coord': np.array([atom.pos.x, atom.pos.y, atom.pos.z]),
                         'atom_name': atom.name,
                         'atom_type': ATOM_TYPES.get(atom.name, 6),
-                        'aa_type': STANDARD_AA.get(residue.name, 0),
+                        'aa_type': aa_type,
                         'residue_name': residue.name,
                         'residue_seq': residue.seqid.num,
                         'chain': chain.name,
+                        'moltype': moltype,
+                        'nucleotide_ss': atom_ss,
                     })
 
-        return atoms_info, ss_map, sorted(chain_ids)
+                moltype_counts[moltype] += 1
+
+        # 日志输出分子类型统计（残基级）
+        nonzero = {k: v for k, v in moltype_counts.items() if v > 0}
+        logger.info(f"  分子类型（残基数）: {nonzero}")
+
+        return atoms_info, ss_map, sorted(chain_ids), moltype_counts
 
     def _save_label_grid(self, data, ref_grid, output_path):
         """保存标签数据为 MRC 格式（保持坐标系）"""
@@ -184,6 +310,14 @@ class CorrespondenceLabeler:
         双层策略：
         1. 距离阈值内: 按最近原子赋标签，高置信度（高斯衰减）
         2. 距离阈值外（Voronoi）: 按最近原子赋标签，低置信度（上限 voronoi_max_confidence）
+
+        标签通道：
+        - label_atom.mrc: 原子类型
+        - label_aa.mrc: 氨基酸/核苷酸/糖基类型 (1-34)
+        - label_ss.mrc: 二级结构 (1-5，含 RNA/DNA sugar_phosphate/base)
+        - label_chain.mrc: 链 ID
+        - label_confidence.mrc: 置信度
+        - label_moltype.mrc: 分子类型 (protein=1, RNA=2, DNA=3, sugar=4, ligand=5)
         """
         map_path = os.path.join(entry_dir, "map_normalized.mrc")
         model_path = os.path.join(entry_dir, "model.cif")
@@ -202,8 +336,8 @@ class CorrespondenceLabeler:
 
         logger.info(f"  Grid: ({nu},{nv},{nw}), spacing: ({grid.spacing[0]:.3f}Å)")
 
-        # 解析结构（包含生物组装体展开）
-        atoms_info, ss_map, chain_ids = self._parse_structure(model_path)
+        # 解析结构（包含生物组装体展开 + 分子类型检测）
+        atoms_info, ss_map, chain_ids, moltype_counts = self._parse_structure(model_path)
         if not atoms_info:
             logger.warning(f"  无原子信息")
             return None
@@ -223,22 +357,32 @@ class CorrespondenceLabeler:
 
         tree = cKDTree(all_grid_idx)
 
-        # 初始化标签
+        # 初始化标签（6 个通道）
         label_atom = np.zeros((nu, nv, nw), dtype=np.int16)
         label_aa = np.zeros((nu, nv, nw), dtype=np.int16)
         label_ss = np.zeros((nu, nv, nw), dtype=np.int16)
         label_chain = np.zeros((nu, nv, nw), dtype=np.int16)
         label_confidence = np.zeros((nu, nv, nw), dtype=np.float32)
+        label_moltype = np.zeros((nu, nv, nw), dtype=np.int16)
 
         # 预计算原子属性数组（向量化赋值用）
         atom_types = np.array([a['atom_type'] for a in atoms_info], dtype=np.int16)
         aa_types = np.array([a['aa_type'] for a in atoms_info], dtype=np.int16)
+
+        # 二级结构：RNA/DNA 用 nucleotide_ss，蛋白质用 ss_map
         ss_types = np.array([
-            SS_LABELS.get(ss_map.get((a['chain'], a['residue_seq']), 'coil'), 1)
+            SS_LABELS.get(a['nucleotide_ss'], 0) if a['nucleotide_ss'] is not None
+            else SS_LABELS.get(ss_map.get((a['chain'], a['residue_seq']), 'coil'), 1)
             for a in atoms_info
         ], dtype=np.int16)
+
         chain_nums = np.array([
             chain_to_num.get(a['chain'], 0) for a in atoms_info
+        ], dtype=np.int16)
+
+        # 分子类型数组
+        moltype_arr = np.array([
+            MOLTYPE_LABELS.get(a['moltype'], 0) for a in atoms_info
         ], dtype=np.int16)
 
         # 只标注有信号的体素
@@ -275,6 +419,7 @@ class CorrespondenceLabeler:
         label_aa[voxel_i, voxel_j, voxel_k] = aa_types[atom_idx]
         label_ss[voxel_i, voxel_j, voxel_k] = ss_types[atom_idx]
         label_chain[voxel_i, voxel_j, voxel_k] = chain_nums[atom_idx]
+        label_moltype[voxel_i, voxel_j, voxel_k] = moltype_arr[atom_idx]
         label_confidence[voxel_i, voxel_j, voxel_k] = np.exp(
             -distances[within_idx]**2 / (2 * sigma**2)
         ).astype(np.float32)
@@ -298,6 +443,7 @@ class CorrespondenceLabeler:
                 label_aa[voxel_i, voxel_j, voxel_k] = aa_types[atom_idx]
                 label_ss[voxel_i, voxel_j, voxel_k] = ss_types[atom_idx]
                 label_chain[voxel_i, voxel_j, voxel_k] = chain_nums[atom_idx]
+                label_moltype[voxel_i, voxel_j, voxel_k] = moltype_arr[atom_idx]
 
                 # Voronoi 置信度：随距离衰减，上限为 voronoi_max_confidence
                 voronoi_conf = self.voronoi_max_confidence * np.exp(
@@ -318,10 +464,18 @@ class CorrespondenceLabeler:
             'label_ss.mrc': label_ss,
             'label_chain.mrc': label_chain,
             'label_confidence.mrc': label_confidence,
+            'label_moltype.mrc': label_moltype,
         }
 
         for fname, ldata in label_files.items():
             self._save_label_grid(ldata, grid, os.path.join(entry_dir, fname))
+
+        # 分子类型体素统计
+        moltype_voxel_counts = {}
+        for name, val in MOLTYPE_LABELS.items():
+            count = int((label_moltype == val).sum())
+            if count > 0:
+                moltype_voxel_counts[name] = count
 
         stats = {
             "n_atoms_total": len(atoms_info),
@@ -340,6 +494,8 @@ class CorrespondenceLabeler:
             "use_voronoi": self.use_voronoi,
             "voronoi_max_confidence": self.voronoi_max_confidence,
             "bio_assembly_expanded": self.bio_assembly_enabled,
+            "moltype_residue_counts": {k: v for k, v in moltype_counts.items() if v > 0},
+            "moltype_voxel_counts": moltype_voxel_counts,
         }
         with open(os.path.join(entry_dir, "labeling_stats.json"), 'w') as f:
             json.dump(stats, f, indent=2)
