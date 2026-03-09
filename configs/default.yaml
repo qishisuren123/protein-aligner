@@ -14,6 +14,12 @@ retrieval:
   method: "singleParticle"  # 成像方法
   max_entries: 5        # 最大下载条目数（样例模式）
 
+# 生物学组装体配置
+bio_assembly:
+  enabled: true         # 启用生物组装体展开
+  assembly_id: "1"      # 使用的组装体 ID（默认第一个）
+  max_chains: 200       # 最大链数安全限制
+
 # 重采样配置
 resample:
   target_voxel_sizes: [1.0]  # 目标体素大小 (Å)
@@ -21,17 +27,21 @@ resample:
 
 # 归一化配置
 normalization:
-  percentile: 95        # 使用第N百分位数进行归一化
+  method: "robust_zscore"  # 方法: robust_zscore, zscore, percentile
+  percentile: 95           # percentile 方法的参数
   clip_min: 0.0
   clip_max: 1.0
 
 # 对齐与质量控制配置
 alignment_qc:
-  # 模拟密度图参数
-  sim_sigma: 0.8          # 高斯模糊 sigma (Å)，控制模拟密度的宽度
+  # DensityCalculatorX 参数
+  density_calculator: "gemmi_dcx"   # 使用 gemmi DensityCalculatorX
+  default_resolution: 2.0           # 无 metadata 时使用的默认分辨率 (Å)
+  dc_blur: 0                        # DensityCalculatorX blur 参数（0 = 最优）
+  # CC 计算参数
   mask_threshold: 0.05    # CC 计算时的 mask 阈值
   # 质量阈值
-  cc_threshold: 0.3       # CC_mask 最低阈值
+  cc_threshold: 0.3       # CC_mask 最低通过阈值
 
 # 对应标注配置
 correspondence:
@@ -72,10 +82,13 @@ correspondence:
     strand: 3
   # 标注距离阈值 (Å)
   distance_threshold: 3.0
+  # Voronoi 全覆盖标注
+  use_voronoi: true                # 启用 Voronoi 标注（距离阈值外的体素）
+  voronoi_max_confidence: 0.3      # Voronoi 标注的最大置信度
 
 # 增强标注配置
 enhancement:
-  sim_b_factor: 100.0   # 模拟B因子
+  sim_b_factor: 100.0   # 模拟B因子（控制密度平滑程度）
   sim_resolution: 2.0   # 模拟分辨率 (Å)
 
 # 去冗余配置

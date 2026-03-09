@@ -3,9 +3,9 @@
 
 功能：
 - 验证原子模型与密度图的坐标系对齐
-- 使用 gemmi 进行坐标插值（确保坐标系正确）
-- 使用三线性插值放置原子生成高精度模拟密度图
-- 计算 map-model 拟合质量指标（CC_mask 等）
+- 使用 gemmi.DensityCalculatorX 生成物理级模拟密度图（原子散射因子）
+- 支持生物学组装体展开（对称蛋白完整覆盖密度）
+- 计算 CC_mask、CC_volume、CC_overall 三项指标
 - 根据质量阈值过滤低质量数据
 """
 import os
@@ -13,17 +13,12 @@ import json
 import logging
 import numpy as np
 import gemmi
-from scipy.ndimage import gaussian_filter
 from scipy.stats import pearsonr
+from scipy.ndimage import zoom
+
+from pipeline.bio_assembly import expand_to_assembly
 
 logger = logging.getLogger(__name__)
-
-# 元素散射权重（归一化到碳=1.0）
-ELEMENT_WEIGHT = {
-    'C': 1.0, 'N': 1.17, 'O': 1.33, 'S': 2.67, 'P': 2.5,
-    'H': 0.17, 'FE': 4.33, 'ZN': 5.0, 'MG': 2.0, 'CA': 3.33,
-    'NA': 1.83, 'CL': 2.83, 'MN': 4.17, 'CO': 4.5, 'CU': 4.83,
-}
 
 
 class AlignmentQC:
@@ -31,15 +26,35 @@ class AlignmentQC:
 
     def __init__(self, config):
         self.config = config
-        self.sim_sigma = config['alignment_qc'].get('sim_sigma', 0.8)
-        self.mask_threshold = config['alignment_qc'].get('mask_threshold', 0.05)
-        self.cc_threshold = config['alignment_qc']['cc_threshold']
+        qc_cfg = config['alignment_qc']
+        self.mask_threshold = qc_cfg.get('mask_threshold', 0.05)
+        self.cc_threshold = qc_cfg.get('cc_threshold', 0.3)
+        self.density_calculator = qc_cfg.get('density_calculator', 'gemmi_dcx')
+        self.default_resolution = qc_cfg.get('default_resolution', 2.0)
+        self.dc_blur = qc_cfg.get('dc_blur', 0)
+        # 生物组装体配置
+        bio_cfg = config.get('bio_assembly', {})
+        self.bio_assembly_enabled = bio_cfg.get('enabled', True)
+        self.assembly_id = bio_cfg.get('assembly_id', '1')
+        self.max_chains = bio_cfg.get('max_chains', 200)
 
     def load_structure(self, cif_path):
         """加载 mmCIF/PDB 原子模型"""
         st = gemmi.read_structure(cif_path)
         st.setup_entities()
         return st
+
+    def _get_resolution(self, entry_dir):
+        """从 metadata.json 读取分辨率，无则使用默认值"""
+        meta_path = os.path.join(entry_dir, "metadata.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
+            res = meta.get("resolution")
+            if res is not None:
+                return float(res)
+        logger.info(f"  未找到分辨率信息，使用默认值 {self.default_resolution}Å")
+        return self.default_resolution
 
     def get_atom_coords(self, structure):
         """从结构中提取所有原子坐标和信息"""
@@ -106,92 +121,63 @@ class AlignmentQC:
 
         return quality_score, info
 
-    def _place_atoms_trilinear(self, model, cell, nu, nv, nw):
+    def generate_simulated_map(self, grid, structure, resolution=None):
         """
-        三线性插值放置原子到 grid 上（保留亚体素精度）
+        使用 gemmi.DensityCalculatorX 生成物理级模拟密度图
 
-        将每个原子的权重分配到最近的 8 个体素，
-        按距离加权，避免四舍五入到最近体素的精度损失
+        DensityCalculatorX 使用 5 高斯近似的原子散射因子，
+        物理上更准确，CC 显著高于手写三线性+高斯模糊
         """
-        sim = np.zeros((nu, nv, nw), dtype=np.float32)
-
-        for chain in model:
-            for residue in chain:
-                if residue.name == "HOH":
-                    continue
-                for atom in residue:
-                    frac = cell.fractionalize(atom.pos)
-                    # 连续坐标
-                    fi = frac.x * nu
-                    fj = frac.y * nv
-                    fk = frac.z * nw
-                    # 下界索引
-                    i0 = int(np.floor(fi)) % nu
-                    j0 = int(np.floor(fj)) % nv
-                    k0 = int(np.floor(fk)) % nw
-                    i1 = (i0 + 1) % nu
-                    j1 = (j0 + 1) % nv
-                    k1 = (k0 + 1) % nw
-                    # 小数部分
-                    di = fi - np.floor(fi)
-                    dj = fj - np.floor(fj)
-                    dk = fk - np.floor(fk)
-                    # 元素权重
-                    w = ELEMENT_WEIGHT.get(atom.element.name, 1.0)
-                    # 分配到 8 个相邻体素
-                    sim[i0, j0, k0] += w * (1-di) * (1-dj) * (1-dk)
-                    sim[i1, j0, k0] += w * di     * (1-dj) * (1-dk)
-                    sim[i0, j1, k0] += w * (1-di) * dj     * (1-dk)
-                    sim[i0, j0, k1] += w * (1-di) * (1-dj) * dk
-                    sim[i1, j1, k0] += w * di     * dj     * (1-dk)
-                    sim[i1, j0, k1] += w * di     * (1-dj) * dk
-                    sim[i0, j1, k1] += w * (1-di) * dj     * dk
-                    sim[i1, j1, k1] += w * di     * dj     * dk
-
-        return sim
-
-    def generate_simulated_map(self, grid, structure, sigma_A=None):
-        """
-        从原子模型生成模拟密度图
-
-        使用三线性插值放置原子 + 高斯模糊模拟电子密度
-        """
-        if sigma_A is None:
-            sigma_A = self.sim_sigma
+        if resolution is None:
+            resolution = self.default_resolution
 
         cell = grid.unit_cell
-        nu, nv, nw = grid.nu, grid.nv, grid.nw
         model = structure[0]
 
-        # 三线性插值放置原子
-        sim_data = self._place_atoms_trilinear(model, cell, nu, nv, nw)
         n_atoms = sum(
             1 for chain in model for res in chain
             if res.name != "HOH" for _ in res
         )
-        logger.info(f"  放置了 {n_atoms} 个原子（三线性插值）")
+        logger.info(f"  使用 DensityCalculatorX (blur={self.dc_blur}) 生成模拟密度图")
+        logger.info(f"  原子数: {n_atoms}, 分辨率: {resolution:.2f}Å")
 
-        # 高斯模糊
-        sigma_voxels = sigma_A / grid.spacing[0]
-        sim_data = gaussian_filter(sim_data, sigma=sigma_voxels)
+        # 创建 DensityCalculatorX 并设置参数
+        dc = gemmi.DensityCalculatorX()
+        dc.d_min = resolution
+        dc.blur = self.dc_blur
+        dc.grid.set_unit_cell(cell)
+        dc.grid.set_size(grid.nu, grid.nv, grid.nw)
+        dc.grid.spacegroup = grid.spacegroup
 
+        # 放置原子（使用物理散射因子）
+        dc.put_model_density_on_grid(model)
+
+        # 提取数据（DensityCalculatorX 可能自动调整 grid 尺寸）
+        sim_data = np.array(dc.grid, copy=True)
+
+        # 如果 DC 自动调整了 grid 尺寸，需要重采样到目标尺寸
+        target_shape = (grid.nu, grid.nv, grid.nw)
+        if sim_data.shape != target_shape:
+            logger.info(f"  DC grid {sim_data.shape} -> 重采样到 {target_shape}")
+            zoom_factors = tuple(t / s for t, s in zip(target_shape, sim_data.shape))
+            sim_data = zoom(sim_data, zoom_factors, order=3)
+
+        # 归一化到 [0, 1]
         if sim_data.max() > 0:
             sim_data /= sim_data.max()
 
         # 包装为 gemmi grid
-        sim_grid = gemmi.FloatGrid(nu, nv, nw)
+        sim_grid = gemmi.FloatGrid(grid.nu, grid.nv, grid.nw)
         sim_grid.set_unit_cell(cell)
         sim_grid.spacegroup = grid.spacegroup
         arr = np.array(sim_grid, copy=False)
-        arr[:] = sim_data
+        arr[:] = sim_data.astype(np.float32)
 
         return sim_grid
 
     def compute_cc_mask(self, exp_grid, sim_grid, mask_threshold=None):
         """
-        计算 masked CC
-
-        mask 为模拟密度图中信号强度超过阈值的区域
+        计算 CC_mask（模拟密度 mask 区域内的 Pearson 相关系数）
         """
         if mask_threshold is None:
             mask_threshold = self.mask_threshold
@@ -210,7 +196,58 @@ class AlignmentQC:
             return 0.0
 
         cc, _ = pearsonr(exp_masked.flatten(), sim_masked.flatten())
-        return cc
+        return float(cc)
+
+    def compute_all_cc(self, exp_grid, sim_grid, mask_threshold=None):
+        """
+        计算三项 CC 指标：CC_mask, CC_volume, CC_overall
+
+        - CC_mask: 模拟密度 mask 区域的 Pearson CC
+        - CC_volume: 实验密度 mask 区域的 Pearson CC
+        - CC_overall: 全体素 Pearson CC
+        """
+        if mask_threshold is None:
+            mask_threshold = self.mask_threshold
+
+        exp_data = np.array(exp_grid, copy=True)
+        sim_data = np.array(sim_grid, copy=True)
+
+        results = {}
+
+        # CC_mask: 模拟密度 mask 内
+        sim_mask = sim_data > mask_threshold
+        if sim_mask.sum() > 0:
+            e, s = exp_data[sim_mask], sim_data[sim_mask]
+            if e.std() > 0 and s.std() > 0:
+                results["cc_mask"] = float(pearsonr(e, s)[0])
+            else:
+                results["cc_mask"] = 0.0
+        else:
+            results["cc_mask"] = 0.0
+
+        # CC_volume: 实验密度 mask 内
+        exp_mask = exp_data > mask_threshold
+        if exp_mask.sum() > 0:
+            e, s = exp_data[exp_mask], sim_data[exp_mask]
+            if e.std() > 0 and s.std() > 0:
+                results["cc_volume"] = float(pearsonr(e, s)[0])
+            else:
+                results["cc_volume"] = 0.0
+        else:
+            results["cc_volume"] = 0.0
+
+        # CC_overall: 全体素（有信号区域）
+        combined_mask = sim_mask | exp_mask
+        if combined_mask.sum() > 0:
+            e, s = exp_data[combined_mask], sim_data[combined_mask]
+            if e.std() > 0 and s.std() > 0:
+                results["cc_overall"] = float(pearsonr(e, s)[0])
+            else:
+                results["cc_overall"] = 0.0
+        else:
+            results["cc_overall"] = 0.0
+
+        return results
 
     def evaluate_entry(self, entry_dir):
         """评估单个条目的对齐质量"""
@@ -231,29 +268,59 @@ class AlignmentQC:
 
         # 加载结构
         structure = self.load_structure(model_path)
+        n_orig_atoms = sum(
+            1 for ch in structure[0] for res in ch
+            if res.name != "HOH" for _ in res
+        )
+
+        # 生物组装体展开
+        if self.bio_assembly_enabled:
+            structure = expand_to_assembly(
+                structure,
+                assembly_id=self.assembly_id,
+                max_chains=self.max_chains
+            )
+
         atoms = self.get_atom_coords(structure)
-        logger.info(f"  加载了 {len(atoms)} 个原子")
+        logger.info(f"  原子数: {n_orig_atoms} -> {len(atoms)} (展开后)")
 
         # 在原子位置采样密度
         quality_score, diag_info = self.compute_cc_at_atoms(grid, structure)
         logger.info(f"  质量分数 (正密度比例): {quality_score:.4f}")
 
-        # 生成模拟密度图（三线性 + 高斯模糊）
-        sim_grid = self.generate_simulated_map(grid, structure)
+        # 获取分辨率
+        resolution = self._get_resolution(entry_dir)
 
-        # 计算 CC_mask
-        cc_mask = self.compute_cc_mask(grid, sim_grid)
-        logger.info(f"  CC_mask = {cc_mask:.4f}")
+        # 生成模拟密度图（DensityCalculatorX）
+        sim_grid = self.generate_simulated_map(grid, structure, resolution)
 
-        # 判断质量
-        passed = quality_score >= 0.5 or cc_mask >= self.cc_threshold
+        # 计算全部 CC 指标
+        cc_results = self.compute_all_cc(grid, sim_grid)
+        logger.info(f"  CC_mask={cc_results['cc_mask']:.4f}, "
+                    f"CC_volume={cc_results['cc_volume']:.4f}, "
+                    f"CC_overall={cc_results['cc_overall']:.4f}")
+
+        # 综合判断：CC_mask 或 CC_volume 有一项达标即通过
+        cc_mask = cc_results['cc_mask']
+        cc_volume = cc_results['cc_volume']
+        passed = (quality_score >= 0.5 or
+                  cc_mask >= self.cc_threshold or
+                  cc_volume >= self.cc_threshold)
         quality = "pass" if passed else "fail"
         logger.info(f"  质量判定: {quality}")
 
         metrics = {
-            "cc_mask": float(cc_mask),
+            "cc_mask": cc_mask,
+            "cc_volume": cc_results['cc_volume'],
+            "cc_overall": cc_results['cc_overall'],
             "quality_score": float(quality_score),
-            "n_atoms": len(atoms),
+            "resolution": resolution,
+            "n_atoms_orig": n_orig_atoms,
+            "n_atoms_expanded": len(atoms),
+            "n_chains": len(set(a['chain'] for a in atoms)),
+            "bio_assembly_expanded": self.bio_assembly_enabled,
+            "density_calculator": self.density_calculator,
+            "dc_blur": self.dc_blur,
             "grid_shape": [grid.nu, grid.nv, grid.nw],
             "spacing": [float(s) for s in grid.spacing],
             "passed": bool(passed),

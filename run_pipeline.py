@@ -84,6 +84,9 @@ def run_pipeline(config, steps='all'):
 
         entry_dirs = [r['dir'] for r in results]
         logger.info(f"Step 1 完成，耗时 {time.time()-t0:.1f}s，下载 {len(entry_dirs)} 个条目")
+
+        # 回填分辨率到 metadata
+        retriever.update_existing_metadata(entry_dirs)
     else:
         # 从已有数据目录加载
         raw_dir = config['paths']['raw_dir']
@@ -93,6 +96,11 @@ def run_pipeline(config, steps='all'):
                 if os.path.isdir(full):
                     entry_dirs.append(full)
         logger.info(f"跳过 Retrieval，加载已有 {len(entry_dirs)} 个条目")
+
+        # 回填已有条目的分辨率
+        if entry_dirs:
+            retriever = Retriever(config)
+            retriever.update_existing_metadata(entry_dirs)
 
     if not entry_dirs:
         logger.error("没有可处理的条目，退出")

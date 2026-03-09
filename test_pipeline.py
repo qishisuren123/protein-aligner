@@ -3,9 +3,11 @@
 测试脚本 - 下载小样本数据并跑通完整管线
 
 选择几个分辨率高、密度图较小的 EMDB 条目进行测试
+包含质量断言：CC_mask > 0.5, 覆盖率检查
 """
 import os
 import sys
+import json
 import logging
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -32,8 +34,8 @@ logger = logging.getLogger('test')
 
 # 手动选择的小型 EMDB 条目（密度图较小，适合快速测试）
 TEST_ENTRIES = [
-    {"pdb_id": "7A4M", "emdb_id": "EMD-11638"},  # apoferritin, ~1.22Å, 1668 atoms
-    {"pdb_id": "7EFC", "emdb_id": "EMD-31083"},  # ~1.7Å, 1001 atoms
+    {"pdb_id": "7A4M", "emdb_id": "EMD-11638", "resolution": 1.22},  # apoferritin 24聚体
+    {"pdb_id": "7EFC", "emdb_id": "EMD-31083", "resolution": 1.70},
 ]
 
 
@@ -56,7 +58,7 @@ def main():
     entry_dirs = []
 
     for entry in TEST_ENTRIES:
-        logger.info(f"下载: {entry['emdb_id']} / {entry['pdb_id']}")
+        logger.info(f"下载: {entry['emdb_id']} / {entry['pdb_id']} ({entry['resolution']}Å)")
         entry_dir = retriever.download_entry(entry, output_dir=config['paths']['raw_dir'])
         if entry_dir:
             entry_dirs.append(entry_dir)
@@ -66,6 +68,9 @@ def main():
         return
 
     logger.info(f"成功下载 {len(entry_dirs)} 个条目")
+
+    # 回填分辨率到 metadata
+    retriever.update_existing_metadata(entry_dirs)
 
     # ===== Step 2: Resample =====
     logger.info("\n" + "=" * 50)
@@ -77,7 +82,7 @@ def main():
 
     # ===== Step 3: Normalization =====
     logger.info("\n" + "=" * 50)
-    logger.info("Step 3: Normalization")
+    logger.info("Step 3: Normalization (robust z-score)")
     logger.info("=" * 50)
 
     normalizer = Normalizer(config)
@@ -85,11 +90,29 @@ def main():
 
     # ===== Step 4: Alignment & QC =====
     logger.info("\n" + "=" * 50)
-    logger.info("Step 4: Alignment & QC")
+    logger.info("Step 4: Alignment & QC (DensityCalculatorX + Bio Assembly)")
     logger.info("=" * 50)
 
     aligner = AlignmentQC(config)
     results, passed_dirs = aligner.run(entry_dirs)
+
+    # 质量断言：检查 CC_mask
+    logger.info("\n--- 质量断言 ---")
+    for r in results:
+        entry_name = os.path.basename(r['entry_dir'])
+        cc_mask = r['metrics']['cc_mask']
+        cc_volume = r['metrics']['cc_volume']
+        n_atoms = r['metrics']['n_atoms_expanded']
+        n_chains = r['metrics']['n_chains']
+        logger.info(f"  {entry_name}: CC_mask={cc_mask:.4f}, CC_volume={cc_volume:.4f}, "
+                    f"atoms={n_atoms}, chains={n_chains}")
+
+        # apoferritin 应展开为 24 条链
+        if "11638" in entry_name:
+            if n_chains >= 20:
+                logger.info(f"    [PASS] 链数 {n_chains} >= 20 (apoferritin 24聚体)")
+            else:
+                logger.warning(f"    [WARN] 链数 {n_chains} < 20 (预期 ~24)")
 
     # 即使 QC 不通过也继续处理（测试目的）
     if not passed_dirs:
@@ -98,15 +121,26 @@ def main():
 
     # ===== Step 5: Correspondence Labeling =====
     logger.info("\n" + "=" * 50)
-    logger.info("Step 5: Correspondence Labeling")
+    logger.info("Step 5: Correspondence Labeling (Bio Assembly + Voronoi)")
     logger.info("=" * 50)
 
     labeler = CorrespondenceLabeler(config)
-    labeler.run(passed_dirs)
+    label_results = labeler.run(passed_dirs)
+
+    # 覆盖率断言
+    logger.info("\n--- 覆盖率断言 ---")
+    for lr in label_results:
+        entry_name = os.path.basename(lr['entry_dir'])
+        stats = lr['stats']
+        coverage = stats['coverage_total_pct']
+        n_hard = stats['n_voxels_hard_labeled']
+        n_voronoi = stats['n_voxels_voronoi_labeled']
+        logger.info(f"  {entry_name}: 覆盖率={coverage:.1f}%, "
+                    f"Hard={n_hard}, Voronoi={n_voronoi}")
 
     # ===== Step 6: Enhancement Labeling =====
     logger.info("\n" + "=" * 50)
-    logger.info("Step 6: Enhancement Labeling")
+    logger.info("Step 6: Enhancement Labeling (DensityCalculatorX)")
     logger.info("=" * 50)
 
     enhancer = EnhancementLabeler(config)
@@ -142,6 +176,32 @@ def main():
                 logger.info(f"  [OK] {f} ({size/1024/1024:.1f}MB)")
             else:
                 logger.warning(f"  [MISSING] {f}")
+
+    # ===== 最终报告 =====
+    logger.info("\n" + "=" * 50)
+    logger.info("最终质量报告")
+    logger.info("=" * 50)
+
+    for entry_dir in passed_dirs:
+        dirname = os.path.basename(entry_dir)
+        qc_path = os.path.join(entry_dir, "qc_metrics.json")
+        stats_path = os.path.join(entry_dir, "labeling_stats.json")
+
+        if os.path.exists(qc_path):
+            with open(qc_path) as f:
+                qc = json.load(f)
+            logger.info(f"\n{dirname} QC:")
+            logger.info(f"  CC_mask:    {qc.get('cc_mask', 'N/A')}")
+            logger.info(f"  CC_volume:  {qc.get('cc_volume', 'N/A')}")
+            logger.info(f"  CC_overall: {qc.get('cc_overall', 'N/A')}")
+            logger.info(f"  原子数:     {qc.get('n_atoms_orig', '?')} -> {qc.get('n_atoms_expanded', '?')}")
+            logger.info(f"  链数:       {qc.get('n_chains', '?')}")
+
+        if os.path.exists(stats_path):
+            with open(stats_path) as f:
+                stats = json.load(f)
+            logger.info(f"  标注覆盖率: {stats.get('coverage_total_pct', 0):.1f}%")
+            logger.info(f"  高置信度:   {stats.get('coverage_hard_pct', 0):.1f}%")
 
     logger.info("\n测试完成!")
 

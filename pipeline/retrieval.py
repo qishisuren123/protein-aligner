@@ -140,6 +140,39 @@ class Retriever:
             logger.warning(f"获取 {pdb_id} 的 EMDB ID 失败: {e}")
         return None
 
+    def _get_resolution(self, pdb_id, emdb_num):
+        """
+        从 RCSB API 获取分辨率信息
+
+        优先从 RCSB entry 获取 resolution_combined，
+        备用从 EMDB API 获取
+        """
+        # 方法1: RCSB entry API
+        try:
+            url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
+            resp = self.session.get(url, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            res = data.get("rcsb_entry_info", {}).get("resolution_combined", [None])
+            if res and res[0] is not None:
+                return float(res[0])
+        except Exception as e:
+            logger.debug(f"从 RCSB 获取分辨率失败: {e}")
+
+        # 方法2: EMDB API
+        try:
+            url = f"{self.emdb_api}/entry/EMD-{emdb_num}"
+            resp = self.session.get(url, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+            res = data.get("map", {}).get("resolution", {}).get("value")
+            if res is not None:
+                return float(res)
+        except Exception as e:
+            logger.debug(f"从 EMDB 获取分辨率失败: {e}")
+
+        return None
+
     def download_entry(self, entry, output_dir=None):
         """
         下载一个条目的密度图和原子模型
@@ -157,10 +190,20 @@ class Retriever:
         entry_dir = os.path.join(output_dir, f"{emdb_id_std}_{pdb_id}")
         os.makedirs(entry_dir, exist_ok=True)
 
-        # 保存元数据
+        # 获取分辨率
+        resolution = entry.get("resolution")
+        if resolution is None:
+            resolution = self._get_resolution(pdb_id, emdb_num)
+            if resolution is not None:
+                logger.info(f"  分辨率: {resolution:.2f}Å")
+
+        # 保存元数据（包含分辨率）
+        metadata = dict(entry)
+        if resolution is not None:
+            metadata["resolution"] = resolution
         meta_path = os.path.join(entry_dir, "metadata.json")
         with open(meta_path, 'w') as f:
-            json.dump(entry, f, indent=2)
+            json.dump(metadata, f, indent=2)
 
         # 下载密度图
         map_ok = self._download_map(emdb_num, entry_dir)
@@ -232,6 +275,36 @@ class Retriever:
             if os.path.exists(model_path):
                 os.remove(model_path)
             return False
+
+    def update_existing_metadata(self, entry_dirs):
+        """
+        回填已下载条目的分辨率信息
+
+        对已有 metadata.json 但缺少 resolution 字段的条目，从 API 获取并写入
+        """
+        updated = 0
+        for entry_dir in entry_dirs:
+            meta_path = os.path.join(entry_dir, "metadata.json")
+            if not os.path.exists(meta_path):
+                continue
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
+            if "resolution" in meta and meta["resolution"] is not None:
+                continue
+
+            pdb_id = meta.get("pdb_id", "")
+            emdb_id = meta.get("emdb_id", "")
+            emdb_num = emdb_id.replace("EMD-", "").replace("emd-", "")
+            resolution = self._get_resolution(pdb_id, emdb_num)
+            if resolution is not None:
+                meta["resolution"] = resolution
+                with open(meta_path, 'w') as f:
+                    json.dump(meta, f, indent=2)
+                logger.info(f"  更新 {os.path.basename(entry_dir)} 分辨率: {resolution:.2f}Å")
+                updated += 1
+
+        logger.info(f"回填分辨率完成: {updated} 个条目已更新")
+        return updated
 
     def run(self, **kwargs):
         """执行完整的检索和下载流程"""

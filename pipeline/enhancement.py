@@ -1,14 +1,20 @@
 """
 模块6: Enhancement Labeling - 增强标注
 
-从原子模型生成模拟密度图（低噪声），作为去噪训练标签
-使用 gemmi 坐标系
+功能：
+- 从原子模型生成模拟密度图（低噪声），作为去噪训练标签
+- 使用 gemmi.DensityCalculatorX 替代手写三线性插值
+- 支持生物学组装体展开
+- 从 metadata 读取分辨率，用 b_factor 控制模糊程度
 """
 import os
+import json
 import logging
 import numpy as np
 import gemmi
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import zoom
+
+from pipeline.bio_assembly import expand_to_assembly
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +24,32 @@ class EnhancementLabeler:
 
     def __init__(self, config):
         self.config = config
-        self.b_factor = config['enhancement']['sim_b_factor']
-        self.resolution = config['enhancement']['sim_resolution']
+        enh_cfg = config['enhancement']
+        self.b_factor = enh_cfg.get('sim_b_factor', 100.0)
+        self.resolution = enh_cfg.get('sim_resolution', 2.0)
+        # 生物组装体配置
+        bio_cfg = config.get('bio_assembly', {})
+        self.bio_assembly_enabled = bio_cfg.get('enabled', True)
+        self.assembly_id = bio_cfg.get('assembly_id', '1')
+        self.max_chains = bio_cfg.get('max_chains', 200)
+
+    def _get_resolution(self, entry_dir):
+        """从 metadata.json 读取分辨率"""
+        meta_path = os.path.join(entry_dir, "metadata.json")
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
+            res = meta.get("resolution")
+            if res is not None:
+                return float(res)
+        return self.resolution
 
     def generate_mol_map(self, entry_dir):
-        """生成模拟密度图 mol_map.mrc"""
+        """
+        使用 DensityCalculatorX 生成模拟密度图 mol_map.mrc
+
+        使用物理散射因子，通过 b_factor 控制平滑程度
+        """
         map_path = os.path.join(entry_dir, "map_normalized.mrc")
         model_path = os.path.join(entry_dir, "model.cif")
 
@@ -39,50 +66,48 @@ class EnhancementLabeler:
 
         # 加载结构
         st = gemmi.read_structure(model_path)
+        st.setup_entities()
+
+        # 生物组装体展开
+        if self.bio_assembly_enabled:
+            st = expand_to_assembly(
+                st,
+                assembly_id=self.assembly_id,
+                max_chains=self.max_chains
+            )
+
         model = st[0]
+        n_atoms = sum(
+            1 for chain in model for res in chain
+            if res.name != "HOH" for _ in res
+        )
 
-        # 元素权重（归一化散射因子的近似）
-        element_weight = {
-            'C': 1.0, 'N': 1.17, 'O': 1.33, 'S': 2.67, 'P': 2.5,
-            'H': 0.17, 'FE': 4.33, 'ZN': 5.0, 'MG': 2.0,
-        }
+        # 获取分辨率
+        resolution = self._get_resolution(entry_dir)
 
-        mol_data = np.zeros((nu, nv, nw), dtype=np.float32)
-        n_atoms = 0
+        # 使用 DensityCalculatorX 生成密度
+        # blur = b_factor 来控制模拟密度的平滑度
+        dc = gemmi.DensityCalculatorX()
+        dc.d_min = resolution
+        dc.blur = self.b_factor
+        dc.grid.set_unit_cell(cell)
+        dc.grid.set_size(nu, nv, nw)
+        dc.grid.spacegroup = ref_grid.spacegroup
 
-        # 三线性插值放置原子（保留亚体素精度）
-        for chain in model:
-            for residue in chain:
-                if residue.name == "HOH":
-                    continue
-                for atom in residue:
-                    frac = cell.fractionalize(atom.pos)
-                    fi, fj, fk = frac.x * nu, frac.y * nv, frac.z * nw
-                    i0 = int(np.floor(fi)) % nu
-                    j0 = int(np.floor(fj)) % nv
-                    k0 = int(np.floor(fk)) % nw
-                    i1, j1, k1 = (i0+1)%nu, (j0+1)%nv, (k0+1)%nw
-                    di = fi - np.floor(fi)
-                    dj = fj - np.floor(fj)
-                    dk = fk - np.floor(fk)
-                    w = element_weight.get(atom.element.name, 1.0)
-                    mol_data[i0,j0,k0] += w*(1-di)*(1-dj)*(1-dk)
-                    mol_data[i1,j0,k0] += w*di*(1-dj)*(1-dk)
-                    mol_data[i0,j1,k0] += w*(1-di)*dj*(1-dk)
-                    mol_data[i0,j0,k1] += w*(1-di)*(1-dj)*dk
-                    mol_data[i1,j1,k0] += w*di*dj*(1-dk)
-                    mol_data[i1,j0,k1] += w*di*(1-dj)*dk
-                    mol_data[i0,j1,k1] += w*(1-di)*dj*dk
-                    mol_data[i1,j1,k1] += w*di*dj*dk
-                    n_atoms += 1
+        dc.put_model_density_on_grid(model)
+        mol_data = np.array(dc.grid, copy=True)
 
-        logger.info(f"  放置了 {n_atoms} 个原子（三线性插值）")
+        # DensityCalculatorX 可能自动调整 grid 尺寸，需要重采样
+        target_shape = (nu, nv, nw)
+        if mol_data.shape != target_shape:
+            logger.info(f"  DC grid {mol_data.shape} -> 重采样到 {target_shape}")
+            zoom_factors = tuple(t / s for t, s in zip(target_shape, mol_data.shape))
+            mol_data = zoom(mol_data, zoom_factors, order=3)
 
-        # 高斯模糊
-        sigma_A = np.sqrt(self.b_factor / (8 * np.pi**2))
-        sigma_voxel = sigma_A / ref_grid.spacing[0]
-        mol_data = gaussian_filter(mol_data, sigma=sigma_voxel)
+        logger.info(f"  DensityCalculatorX: {n_atoms} 原子, "
+                    f"resolution={resolution:.2f}Å, blur={self.b_factor}")
 
+        # 归一化
         if mol_data.max() > 0:
             mol_data /= mol_data.max()
 
@@ -92,7 +117,7 @@ class EnhancementLabeler:
         new_grid.set_unit_cell(cell)
         new_grid.spacegroup = ref_grid.spacegroup
         arr = np.array(new_grid, copy=False)
-        arr[:] = mol_data
+        arr[:] = mol_data.astype(np.float32)
 
         new_ccp4 = gemmi.Ccp4Map()
         new_ccp4.grid = new_grid
@@ -112,7 +137,7 @@ class EnhancementLabeler:
                 if output:
                     results.append({"entry_dir": entry_dir, "output": output})
             except Exception as e:
-                logger.error(f"  增强标注失败: {e}")
+                logger.error(f"  增强标注失败: {e}", exc_info=True)
 
         logger.info(f"增强标注完成: {len(results)} 个条目")
         return results
