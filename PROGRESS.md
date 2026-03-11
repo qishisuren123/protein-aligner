@@ -1,5 +1,69 @@
 # Cryo-EM 数据处理管线 - 进展记录
 
+## 2026-03-11
+
+### V3 管线重构：Model Building 多层级标注数据集
+
+#### 核心设计变化
+- **CA-only 标注范式**：语义标签只在 CA 原子位置标注，减少噪声
+- **三组 KDTree**：all-atom (segment/atom) + CA-only (aa/ss/chain/domain/interface) + backbone (qscore)
+- **蛋白专注**：移除 RNA/DNA/糖基/配体标注
+- **8 个标签通道**：segment, atom, aa, ss, qscore, chain, domain, interface
+
+#### 新增功能
+
+1. **Q-score 持久化** (`pipeline/alignment_qc.py`)
+   - 逐原子 Q-score 保存为 `qscores.json`
+   - correspondence 步骤读取生成 `label_qscore.mrc`
+
+2. **Domain Segmentation** (`pipeline/domain.py` 新建)
+   - Merizo 深度学习工具封装
+   - mmCIF → PDB 转换 → Merizo 运行 → 解析输出
+   - 在原始结构上运行，残基序号复制到展开链
+   - 回退：Merizo 不可用时全零
+
+3. **Interface Detection** (`pipeline/interface.py` 新建)
+   - CA-CA 跨链距离检测（阈值 5.0Å）
+   - 每条链建 cKDTree，批量查询
+   - 高效处理多链蛋白
+
+4. **Correspondence V3** (`pipeline/correspondence.py` 重写)
+   - 三组 KDTree 架构
+   - 只处理蛋白质残基 (`gemmi.ResidueKind.AA`)
+   - 8 个标签通道输出
+   - Voronoi 默认关闭
+   - 删除 V2 的 moltype/confidence/nucleotide/sugar 组件
+
+5. **Pfam Annotation** (`pipeline/pfam.py` 新建)
+   - HMMER hmmscan 搜索 Pfam-A
+   - Union-Find 按 Pfam family 分组
+   - 回退到 MMseqs2
+
+6. **Redundancy V3** (`pipeline/redundancy.py` 修改)
+   - Pfam Fold/Family Split 优先
+   - V3 文件列表（8 标签 + qscores.json + domain_assignment.json）
+
+7. **外部工具安装脚本** (`scripts/install_tools.sh` 新建)
+   - PyTorch CPU + Merizo + HMMER + Pfam-A
+
+#### 修改文件清单
+- `scripts/install_tools.sh` — 新建，外部工具安装
+- `pipeline/alignment_qc.py` — Q-score 持久化到 qscores.json
+- `pipeline/domain.py` — 新建，Merizo 结构域分割
+- `pipeline/interface.py` — 新建，CA-CA 界面检测
+- `pipeline/correspondence.py` — 重写，V3 三 KDTree + 8 通道
+- `pipeline/pfam.py` — 新建，HMMER+Pfam 注释
+- `pipeline/redundancy.py` — Pfam split + V3 文件列表
+- `configs/default.yaml` — V3 配置（domain/interface/pfam）
+- `run_pipeline.py` — 插入 Step 5 Domain Segmentation（8步）
+- `test_pipeline.py` — V3 断言（segment二值/qscore非零/interface检测/domain）
+- `visualize_labels.py` — V3 面板（9列：含 Q-score/Domain/Interface）
+- `visualize_dataset.py` — 替换分子类型饼图为 Domain/Interface 分布
+- `README.md` — V3 文档重写
+- `PROGRESS.md` — 新增 V3 条目
+
+---
+
 ## 2026-03-09
 
 ### V2 管线优化：发表级质量提升

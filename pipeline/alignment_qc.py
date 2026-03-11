@@ -356,6 +356,18 @@ class AlignmentQC:
             metrics.update(qscore_summary)
             logger.info(f"  Q-score: mean={qscore_summary['q_score_mean']:.3f}, "
                         f"median={qscore_summary['q_score_median']:.3f}")
+
+            # 持久化逐原子 Q-score，供 correspondence 步骤生成 label_qscore.mrc
+            # key 格式: "{chain}_{resseq}_{atomname}" → float
+            qscore_dict = {}
+            for (chain, resseq, atomname), val in qscores.items():
+                key = f"{chain}_{resseq}_{atomname}"
+                qscore_dict[key] = round(val, 6)
+            qscore_path = os.path.join(entry_dir, "qscores.json")
+            with open(qscore_path, 'w') as f:
+                json.dump(qscore_dict, f)
+            logger.info(f"  Q-score 逐原子数据已保存: {qscore_path} ({len(qscore_dict)} 原子)")
+
         except Exception as e:
             logger.warning(f"  Q-score 计算失败: {e}")
 

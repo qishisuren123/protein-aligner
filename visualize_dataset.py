@@ -1,13 +1,20 @@
 #!/usr/bin/env python
 """
-数据集统计可视化 — 生成发表级数据集概览图
+数据集统计可视化 V3 — 生成发表级数据集概览图
 
-生成 5 个子图：
+V3 变更：
+- 移除分子类型饼图（蛋白专注）
+- 新增：Domain 数量分布
+- 新增：Interface 比例分布
+- 更新覆盖率为 segment/CA-only
+
+生成 6 个子图：
 1. 分辨率分布直方图
 2. CC_mask vs 分辨率散点图（按 tier 着色）
-3. 分子类型饼图
-4. 覆盖率分布（Hard vs Voronoi）
+3. Domain 数量分布
+4. 覆盖率分布（Segment vs CA-only）
 5. Q-score 分布
+6. Interface 比例分布
 
 输出: data/output/dataset_overview.png
 """
@@ -50,15 +57,25 @@ def collect_data(raw_dir):
         entry["q_score_mean"] = qc.get("q_score_mean")
         entry["q_score_median"] = qc.get("q_score_median")
 
-        # 标注统计
+        # V3 标注统计
         label_path = os.path.join(entry_dir, "labeling_stats.json")
         if os.path.exists(label_path):
             with open(label_path) as f:
                 stats = json.load(f)
-            entry["coverage_hard_pct"] = stats.get("coverage_hard_pct", 0)
-            entry["coverage_total_pct"] = stats.get("coverage_total_pct", 0)
-            entry["moltype_residue_counts"] = stats.get("moltype_residue_counts", {})
-            entry["moltype_voxel_counts"] = stats.get("moltype_voxel_counts", {})
+            entry["coverage_segment_pct"] = stats.get("coverage_segment_pct", 0)
+            entry["coverage_ca_pct"] = stats.get("coverage_ca_pct", 0)
+            entry["n_interface_voxels"] = stats.get("n_interface_voxels", 0)
+            entry["n_unique_domains"] = stats.get("n_unique_domains", 0)
+            entry["n_voxels_segment"] = stats.get("n_voxels_segment", 0)
+            entry["n_voxels_total"] = stats.get("n_voxels_total", 1)
+
+        # Domain 信息
+        dom_path = os.path.join(entry_dir, "domain_assignment.json")
+        if os.path.exists(dom_path):
+            with open(dom_path) as f:
+                dom = json.load(f)
+            entry["n_domains"] = dom.get("n_domains", 0)
+            entry["domain_method"] = dom.get("method", "none")
 
         entries.append(entry)
 
@@ -79,29 +96,8 @@ def classify_tier(entry):
     return "Hard"
 
 
-def classify_moltype(entry):
-    """确定条目的主要分子类型"""
-    counts = entry.get("moltype_residue_counts", {})
-    has_protein = counts.get("protein", 0) > 0
-    has_rna = counts.get("RNA", 0) > 0
-    has_dna = counts.get("DNA", 0) > 0
-    has_sugar = counts.get("sugar", 0) > 0
-
-    if has_rna and has_protein:
-        return "Protein-RNA"
-    if has_dna and has_protein:
-        return "Protein-DNA"
-    if has_sugar and has_protein:
-        return "Glycoprotein"
-    if has_protein:
-        return "Protein"
-    if has_rna:
-        return "RNA"
-    return "Other"
-
-
 def plot_dataset_overview(entries, output_path):
-    """生成发表级数据集概览图"""
+    """生成 V3 发表级数据集概览图"""
     if not entries:
         print("没有数据可以绘制")
         return
@@ -122,11 +118,6 @@ def plot_dataset_overview(entries, output_path):
 
     # 颜色方案
     tier_colors = {"Gold": "#FFD700", "Silver": "#C0C0C0", "Hard": "#CD7F32"}
-    moltype_colors = {
-        "Protein": "#4C72B0", "Protein-RNA": "#DD8452",
-        "Protein-DNA": "#55A868", "Glycoprotein": "#C44E52",
-        "RNA": "#8172B3", "Other": "#937860"
-    }
 
     # === 1. 分辨率分布直方图 ===
     ax1 = fig.add_subplot(gs[0, 0])
@@ -163,43 +154,36 @@ def plot_dataset_overview(entries, output_path):
     ax2.set_title("CC_mask vs Resolution")
     ax2.grid(True, alpha=0.3)
 
-    # === 3. 分子类型饼图 ===
+    # === 3. Domain 数量分布（V3 新增，替代分子类型饼图） ===
     ax3 = fig.add_subplot(gs[0, 2])
-    mol_counts = {}
-    for entry in entries:
-        mt = classify_moltype(entry)
-        mol_counts[mt] = mol_counts.get(mt, 0) + 1
-    if mol_counts:
-        labels = list(mol_counts.keys())
-        sizes = list(mol_counts.values())
-        colors = [moltype_colors.get(l, "#999999") for l in labels]
-        wedges, texts, autotexts = ax3.pie(
-            sizes, labels=labels, colors=colors, autopct='%1.0f%%',
-            startangle=90, pctdistance=0.85
-        )
-        for t in autotexts:
-            t.set_fontsize(9)
-        ax3.set_title("Molecule Types")
+    n_domains_list = [e.get("n_domains", 0) for e in entries]
+    names_short = [e["name"].replace("EMD-", "").replace("_", "\n") for e in entries]
+    if names_short:
+        colors_dom = ['seagreen' if d > 0 else 'lightgray' for d in n_domains_list]
+        ax3.bar(range(len(names_short)), n_domains_list, color=colors_dom, edgecolor='white')
+        ax3.set_xlabel("Entry")
+        ax3.set_ylabel("# Domains")
+        ax3.set_title("Domain Count per Entry (Merizo)")
+        ax3.set_xticks(range(len(names_short)))
+        ax3.set_xticklabels(names_short, fontsize=7, rotation=45, ha='right')
+        for i, v in enumerate(n_domains_list):
+            ax3.text(i, v + 0.1, str(v), ha='center', va='bottom', fontsize=8)
 
-    # === 4. 覆盖率分布（Hard vs Total） ===
+    # === 4. 覆盖率分布（V3: Segment vs CA-only） ===
     ax4 = fig.add_subplot(gs[1, 0])
-    hard_cov = [e.get("coverage_hard_pct", 0) for e in entries
-                if e.get("coverage_hard_pct") is not None]
-    total_cov = [e.get("coverage_total_pct", 0) for e in entries
-                 if e.get("coverage_total_pct") is not None]
-    names = [e["name"].replace("EMD-", "").replace("_", "\n")
-             for e in entries if e.get("coverage_total_pct") is not None]
-    if names:
-        x = np.arange(len(names))
+    seg_cov = [e.get("coverage_segment_pct", 0) for e in entries]
+    ca_cov = [e.get("coverage_ca_pct", 0) for e in entries]
+    names_cov = [e["name"].replace("EMD-", "").replace("_", "\n") for e in entries]
+    if names_cov:
+        x = np.arange(len(names_cov))
         width = 0.35
-        ax4.bar(x - width/2, hard_cov, width, label="Hard", color="#4C72B0", alpha=0.8)
-        ax4.bar(x + width/2, total_cov, width, label="Total (+ Voronoi)",
-                color="#DD8452", alpha=0.8)
+        ax4.bar(x - width/2, seg_cov, width, label="Segment (all atom)", color="#4C72B0", alpha=0.8)
+        ax4.bar(x + width/2, ca_cov, width, label="CA-only", color="#DD8452", alpha=0.8)
         ax4.set_xlabel("Entry")
         ax4.set_ylabel("Coverage (%)")
-        ax4.set_title("Labeling Coverage")
+        ax4.set_title("V3 Labeling Coverage")
         ax4.set_xticks(x)
-        ax4.set_xticklabels(names, fontsize=7, rotation=45, ha='right')
+        ax4.set_xticklabels(names_cov, fontsize=7, rotation=45, ha='right')
         ax4.legend()
 
     # === 5. Q-score 分布 ===
@@ -228,34 +212,42 @@ def plot_dataset_overview(entries, output_path):
         ax5.legend()
         ax5.set_ylim(0, 1)
 
-    # === 6. 数据分层统计 ===
+    # === 6. Interface 比例分布（V3 新增） ===
     ax6 = fig.add_subplot(gs[1, 2])
-    tier_counts = {"Gold": 0, "Silver": 0, "Hard": 0}
-    for entry in entries:
-        tier = classify_tier(entry)
-        tier_counts[tier] += 1
-    labels_t = list(tier_counts.keys())
-    sizes_t = list(tier_counts.values())
-    colors_t = [tier_colors[l] for l in labels_t]
-    bars = ax6.bar(labels_t, sizes_t, color=colors_t, edgecolor='black', linewidth=0.5)
-    for bar, val in zip(bars, sizes_t):
-        ax6.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
-                 str(val), ha='center', va='bottom', fontweight='bold')
-    ax6.set_ylabel("Count")
-    ax6.set_title("Data Quality Tiers")
+    iface_pcts = []
+    iface_names = []
+    for e in entries:
+        n_iface = e.get("n_interface_voxels", 0)
+        n_seg = e.get("n_voxels_segment", 0)
+        if n_seg > 0:
+            iface_pcts.append(100.0 * n_iface / n_seg)
+        else:
+            iface_pcts.append(0)
+        iface_names.append(e["name"].replace("EMD-", "").replace("_", "\n"))
+    if iface_names:
+        colors_if = ['#C44E52' if p > 0 else 'lightgray' for p in iface_pcts]
+        ax6.bar(range(len(iface_names)), iface_pcts, color=colors_if, edgecolor='white')
+        ax6.set_xlabel("Entry")
+        ax6.set_ylabel("Interface Voxels (%)")
+        ax6.set_title("Protein-Protein Interface Ratio")
+        ax6.set_xticks(range(len(iface_names)))
+        ax6.set_xticklabels(iface_names, fontsize=7, rotation=45, ha='right')
+        for i, v in enumerate(iface_pcts):
+            if v > 0:
+                ax6.text(i, v + 0.5, f'{v:.1f}%', ha='center', va='bottom', fontsize=7)
 
     # 总标题
-    fig.suptitle("Cryo-EM Dataset Overview", fontsize=14, fontweight='bold', y=0.98)
+    fig.suptitle("Cryo-EM Dataset Overview (V3)", fontsize=14, fontweight='bold', y=0.98)
 
     # 保存
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     plt.savefig(output_path, bbox_inches='tight', dpi=150)
     plt.close()
-    print(f"数据集概览图已保存: {output_path}")
+    print(f"V3 数据集概览图已保存: {output_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="生成数据集统计概览图")
+    parser = argparse.ArgumentParser(description="V3 数据集统计概览图")
     parser.add_argument("--raw-dir", default=os.path.join(PROJECT_ROOT, "data/raw"),
                         help="原始数据目录")
     parser.add_argument("--output", default=os.path.join(PROJECT_ROOT, "data/output/dataset_overview.png"),

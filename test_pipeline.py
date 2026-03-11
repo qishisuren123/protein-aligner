@@ -1,13 +1,18 @@
 #!/usr/bin/env python
 """
-测试脚本 - 下载小样本数据并跑通完整管线
+测试脚本 V3 - 下载小样本数据并跑通完整管线
 
 覆盖全类别：
 - 蛋白质 (apoferritin 24聚体, 另一个蛋白)
 - 蛋白质-RNA 复合物
 - 糖蛋白 (含 NAG 修饰)
 
-包含质量断言：CC_mask > 0.5, 覆盖率检查, 分子类型验证
+V3 断言：
+- label_segment.mrc 只有 0/1
+- label_qscore.mrc 有非零浮点值
+- label_interface.mrc 在多链条目中有 interface 体素
+- label_domain.mrc 生成（可能全零若 Merizo 不可用）
+- 8 个标签通道 + qscores.json + domain_assignment.json
 """
 import os
 import sys
@@ -23,6 +28,7 @@ from pipeline.retrieval import Retriever
 from pipeline.resample import Resampler
 from pipeline.normalization import Normalizer
 from pipeline.alignment_qc import AlignmentQC
+from pipeline.domain import DomainSegmenter
 from pipeline.correspondence import CorrespondenceLabeler
 from pipeline.enhancement import EnhancementLabeler
 from pipeline.redundancy import RedundancyRemover
@@ -119,7 +125,7 @@ def main():
     aligner = AlignmentQC(config)
     results, passed_dirs = aligner.run(entry_dirs)
 
-    # 质量断言：检查 CC_mask 和 Q-score
+    # 质量断言
     logger.info("\n--- 质量断言 ---")
     for r in results:
         entry_name = os.path.basename(r['entry_dir'])
@@ -140,77 +146,101 @@ def main():
             else:
                 logger.warning(f"    [WARN] 链数 {n_chains} < 20 (预期 ~24)")
 
+        # V3: 检查 qscores.json 已生成
+        qscore_file = os.path.join(r['entry_dir'], "qscores.json")
+        if os.path.exists(qscore_file):
+            with open(qscore_file) as f:
+                qs_data = json.load(f)
+            logger.info(f"    [PASS] qscores.json: {len(qs_data)} 原子")
+        else:
+            logger.warning(f"    [WARN] qscores.json 未生成")
+
     # 即使 QC 不通过也继续处理（测试目的）
     if not passed_dirs:
         logger.warning("没有通过 QC 的条目，使用所有条目继续测试")
         passed_dirs = entry_dirs
 
-    # ===== Step 5: Correspondence Labeling =====
+    # ===== Step 5: Domain Segmentation (V3 新增) =====
     logger.info("\n" + "=" * 60)
-    logger.info("Step 5: Correspondence Labeling (多分子类型 + Bio Assembly + Voronoi)")
+    logger.info("Step 5: Domain Segmentation (Merizo)")
+    logger.info("=" * 60)
+
+    segmenter = DomainSegmenter(config)
+    domain_results = segmenter.run(passed_dirs)
+
+    for dr in domain_results:
+        entry_name = os.path.basename(dr['entry_dir'])
+        n_domains = dr['data'].get('n_domains', 0)
+        method = dr['data'].get('method', 'unknown')
+        logger.info(f"  {entry_name}: {n_domains} domains (method={method})")
+
+    # ===== Step 6: Correspondence Labeling (V3) =====
+    logger.info("\n" + "=" * 60)
+    logger.info("Step 6: Correspondence Labeling V3 (三 KDTree + CA-only + 8 通道)")
     logger.info("=" * 60)
 
     labeler = CorrespondenceLabeler(config)
     label_results = labeler.run(passed_dirs)
 
-    # 覆盖率断言 + 分子类型验证
-    logger.info("\n--- 覆盖率 & 分子类型断言 ---")
+    # V3 覆盖率断言
+    logger.info("\n--- V3 标签断言 ---")
     for lr in label_results:
         entry_name = os.path.basename(lr['entry_dir'])
         stats = lr['stats']
-        coverage = stats['coverage_total_pct']
-        n_hard = stats['n_voxels_hard_labeled']
-        n_voronoi = stats['n_voxels_voronoi_labeled']
-        moltype_res = stats.get('moltype_residue_counts', {})
-        moltype_vox = stats.get('moltype_voxel_counts', {})
-        logger.info(f"  {entry_name}: 覆盖率={coverage:.1f}%, "
-                    f"Hard={n_hard}, Voronoi={n_voronoi}")
-        logger.info(f"    分子类型(残基): {moltype_res}")
-        logger.info(f"    分子类型(体素): {moltype_vox}")
+        coverage_seg = stats.get('coverage_segment_pct', 0)
+        coverage_ca = stats.get('coverage_ca_pct', 0)
+        n_interface = stats.get('n_interface_voxels', 0)
+        n_domain = stats.get('n_domain_voxels', 0)
+        logger.info(f"  {entry_name}: segment覆盖={coverage_seg:.1f}%, "
+                    f"CA覆盖={coverage_ca:.1f}%, "
+                    f"interface体素={n_interface}, domain体素={n_domain}")
 
-        # RNA 条目应包含 RNA 类型体素
-        if "62134" in entry_name:
-            rna_voxels = moltype_vox.get('RNA', 0)
-            if rna_voxels > 0:
-                logger.info(f"    [PASS] RNA 体素 = {rna_voxels}")
-            else:
-                logger.warning(f"    [WARN] 未检测到 RNA 体素")
+        # 1. label_segment.mrc 只有 0/1
+        seg_path = os.path.join(lr['entry_dir'], "label_segment.mrc")
+        if os.path.exists(seg_path):
+            seg_data = _load_mrc_data(seg_path)
+            unique_vals = set(np.unique(np.round(seg_data).astype(int)))
+            is_binary = unique_vals <= {0, 1}
+            logger.info(f"    [{'PASS' if is_binary else 'FAIL'}] "
+                        f"label_segment 二值: {unique_vals}")
 
-            # 验证 label_moltype.mrc 包含 RNA (moltype=2)
-            moltype_path = os.path.join(lr['entry_dir'], "label_moltype.mrc")
-            if os.path.exists(moltype_path):
-                moltype_data = _load_mrc_data(moltype_path)
-                has_rna = np.any(moltype_data == 2)
-                logger.info(f"    [{'PASS' if has_rna else 'WARN'}] "
-                            f"label_moltype.mrc 包含 RNA(2): {has_rna}")
+        # 2. label_qscore.mrc 有非零浮点值
+        qs_path = os.path.join(lr['entry_dir'], "label_qscore.mrc")
+        if os.path.exists(qs_path):
+            qs_data = _load_mrc_data(qs_path)
+            has_nonzero = np.any(qs_data != 0)
+            qs_range = (float(qs_data.min()), float(qs_data.max()))
+            logger.info(f"    [{'PASS' if has_nonzero else 'WARN'}] "
+                        f"label_qscore 非零: {has_nonzero}, 范围: {qs_range}")
 
-        # 糖蛋白条目应包含 sugar 类型体素
-        if "38560" in entry_name:
-            sugar_voxels = moltype_vox.get('sugar', 0)
-            if sugar_voxels > 0:
-                logger.info(f"    [PASS] Sugar 体素 = {sugar_voxels}")
-            else:
-                logger.warning(f"    [WARN] 未检测到 sugar 体素")
+        # 3. apoferritin（24链）的 label_interface.mrc 有 interface 体素
+        if "11638" in entry_name:
+            iface_path = os.path.join(lr['entry_dir'], "label_interface.mrc")
+            if os.path.exists(iface_path):
+                iface_data = _load_mrc_data(iface_path)
+                has_interface = np.any(iface_data > 0)
+                n_iface = int((iface_data > 0).sum())
+                logger.info(f"    [{'PASS' if has_interface else 'FAIL'}] "
+                            f"label_interface 有界面: {has_interface} ({n_iface} 体素)")
 
-            # 验证 label_moltype.mrc 包含 sugar (moltype=4)
-            moltype_path = os.path.join(lr['entry_dir'], "label_moltype.mrc")
-            if os.path.exists(moltype_path):
-                moltype_data = _load_mrc_data(moltype_path)
-                has_sugar = np.any(moltype_data == 4)
-                logger.info(f"    [{'PASS' if has_sugar else 'WARN'}] "
-                            f"label_moltype.mrc 包含 sugar(4): {has_sugar}")
+        # 4. label_domain.mrc 存在
+        dom_path = os.path.join(lr['entry_dir'], "label_domain.mrc")
+        if os.path.exists(dom_path):
+            dom_data = _load_mrc_data(dom_path)
+            n_dom_voxels = int((dom_data > 0).sum())
+            logger.info(f"    [INFO] label_domain: {n_dom_voxels} 体素标注")
 
-    # ===== Step 6: Enhancement Labeling =====
+    # ===== Step 7: Enhancement Labeling =====
     logger.info("\n" + "=" * 60)
-    logger.info("Step 6: Enhancement Labeling (自适应 blur)")
+    logger.info("Step 7: Enhancement Labeling (自适应 blur)")
     logger.info("=" * 60)
 
     enhancer = EnhancementLabeler(config)
     enhancer.run(passed_dirs)
 
-    # ===== Step 7: Redundancy Removal & Packaging =====
+    # ===== Step 8: Redundancy Removal & Packaging =====
     logger.info("\n" + "=" * 60)
-    logger.info("Step 7: Redundancy Removal & Packaging (含数据分层)")
+    logger.info("Step 8: Redundancy Removal & Packaging (含 Pfam)")
     logger.info("=" * 60)
 
     remover = RedundancyRemover(config)
@@ -218,18 +248,23 @@ def main():
 
     # ===== 验证输出 =====
     logger.info("\n" + "=" * 60)
-    logger.info("验证输出文件")
+    logger.info("验证输出文件 (V3)")
     logger.info("=" * 60)
 
     for entry_dir in passed_dirs:
         dirname = os.path.basename(entry_dir)
         logger.info(f"\n条目: {dirname}")
+        # V3 文件列表
         expected_files = [
             "raw_map.map", "map_std_1.0A.mrc", "map_normalized.mrc",
             "sim_map.mrc", "mol_map.mrc",
-            "label_atom.mrc", "label_aa.mrc", "label_ss.mrc",
-            "label_chain.mrc", "label_confidence.mrc", "label_moltype.mrc",
-            "qc_metrics.json", "labeling_stats.json", "metadata.json"
+            # V3: 8 个标签通道
+            "label_segment.mrc", "label_atom.mrc", "label_aa.mrc",
+            "label_ss.mrc", "label_qscore.mrc", "label_chain.mrc",
+            "label_domain.mrc", "label_interface.mrc",
+            # 元数据
+            "qc_metrics.json", "labeling_stats.json", "metadata.json",
+            "qscores.json", "domain_assignment.json",
         ]
         for f in expected_files:
             path = os.path.join(entry_dir, f)
@@ -239,19 +274,22 @@ def main():
             else:
                 logger.warning(f"  [MISSING] {f}")
 
-    # ===== 验证 dataset_report.json 包含 tier =====
+    # ===== 验证 dataset_report.json =====
     report_path = os.path.join(config['paths']['output_dir'], "dataset_report.json")
     if os.path.exists(report_path):
         with open(report_path) as f:
             report = json.load(f)
         tiers = report.get("tiers", {})
         logger.info(f"\n数据分层: {tiers}")
+        pfam = report.get("pfam_annotations", {})
+        if pfam:
+            logger.info(f"Pfam 注释: {len(pfam)} 条目有 Pfam hit")
         for name, info in report.get("entries", {}).items():
             logger.info(f"  {name}: tier={info.get('tier', 'N/A')}")
 
     # ===== 最终报告 =====
     logger.info("\n" + "=" * 60)
-    logger.info("最终质量报告")
+    logger.info("V3 最终质量报告")
     logger.info("=" * 60)
 
     for entry_dir in passed_dirs:
@@ -274,13 +312,12 @@ def main():
         if os.path.exists(stats_path):
             with open(stats_path) as f:
                 stats = json.load(f)
-            logger.info(f"  标注覆盖率:   {stats.get('coverage_total_pct', 0):.1f}%")
-            logger.info(f"  高置信度:     {stats.get('coverage_hard_pct', 0):.1f}%")
-            moltype = stats.get('moltype_residue_counts', {})
-            if moltype:
-                logger.info(f"  分子类型:     {moltype}")
+            logger.info(f"  segment覆盖:  {stats.get('coverage_segment_pct', 0):.1f}%")
+            logger.info(f"  CA覆盖:       {stats.get('coverage_ca_pct', 0):.1f}%")
+            logger.info(f"  interface体素: {stats.get('n_interface_voxels', 0)}")
+            logger.info(f"  domain体素:   {stats.get('n_domain_voxels', 0)}")
 
-    logger.info("\n测试完成!")
+    logger.info("\nV3 测试完成!")
 
 
 if __name__ == '__main__':

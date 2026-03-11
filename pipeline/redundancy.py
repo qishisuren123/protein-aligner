@@ -1,12 +1,13 @@
 """
-模块7: Remove Redundancy & Packaging - 去冗余与打包
+模块7: Remove Redundancy & Packaging - 去冗余与打包 (V3)
 
 功能：
 - 从蛋白质序列角度进行去冗余（支持 MMseqs2 精确聚类或 3-mer Jaccard 近似聚类）
+- V3 新增：Pfam Fold/Family Split 防止结构同源泄露
 - Gold/Silver/Hard 数据质量分层
 - 划分 train/val/test 集（按聚类划分防止数据泄露）
 - 生成数据集统计报告
-- 打包成可分发的数据集格式
+- 打包成可分发的数据集格式（V3: 8 个标签通道）
 """
 import os
 import json
@@ -20,6 +21,8 @@ from collections import defaultdict
 
 import numpy as np
 import gemmi
+
+from pipeline.pfam import PfamAnnotator
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,9 @@ class RedundancyRemover:
         self.mmseqs2_binary = red_cfg.get('mmseqs2_binary', 'tools/mmseqs')
         # 数据分层配置
         self.tier_cfg = red_cfg.get('tiers', {})
+        # V3: Pfam split 配置
+        pfam_cfg = red_cfg.get('pfam', {})
+        self.pfam_enabled = pfam_cfg.get('enabled', False)
 
     # ===== 序列提取 =====
 
@@ -445,13 +451,17 @@ class RedundancyRemover:
         """
         os.makedirs(output_dir, exist_ok=True)
 
-        # 需要打包的文件列表（新增 label_moltype.mrc）
+        # V3 文件列表（8 个标签通道 + 辅助文件）
         files_to_copy = [
             "map_normalized.mrc", "model.cif", "raw_map.map",
             "sim_map.mrc", "mol_map.mrc",
-            "label_atom.mrc", "label_aa.mrc", "label_ss.mrc",
-            "label_chain.mrc", "label_confidence.mrc", "label_moltype.mrc",
-            "qc_metrics.json", "labeling_stats.json", "metadata.json"
+            # V3: 8 个标签通道
+            "label_segment.mrc", "label_atom.mrc", "label_aa.mrc",
+            "label_ss.mrc", "label_qscore.mrc", "label_chain.mrc",
+            "label_domain.mrc", "label_interface.mrc",
+            # 元数据
+            "qc_metrics.json", "labeling_stats.json", "metadata.json",
+            "qscores.json", "domain_assignment.json",
         ]
 
         for split_name, entry_dirs in splits.items():
@@ -486,19 +496,38 @@ class RedundancyRemover:
         # 1. 提取序列
         sequences = self.extract_sequences(entry_dirs)
 
-        # 2. 序列聚类（根据配置选择方法）
-        if self.use_mmseqs2:
+        # 2. V3: 优先使用 Pfam Fold/Family Split
+        pfam_groups = None
+        entry_pfam_map = {}
+        if self.pfam_enabled:
+            try:
+                pfam_annotator = PfamAnnotator(self.config)
+                pfam_groups, entry_pfam_map = pfam_annotator.annotate_entries(entry_dirs)
+            except Exception as e:
+                logger.warning(f"  Pfam 注释失败: {e}，回退到序列聚类")
+
+        # 3. 序列聚类（Pfam 不可用时使用）
+        if pfam_groups is not None and len(pfam_groups) > 0:
+            clusters = pfam_groups
+            logger.info(f"使用 Pfam Fold/Family Split: {len(clusters)} 组")
+        elif self.use_mmseqs2:
             clusters = self.mmseqs2_clustering(sequences)
         else:
             clusters = self.simple_sequence_clustering(sequences)
 
-        # 3. 划分数据集
+        # 4. 划分数据集
         splits = self.split_dataset(clusters)
 
-        # 4. 生成报告（含数据分层）
-        self.generate_report(entry_dirs, clusters, splits, output_dir)
+        # 5. 生成报告（含数据分层 + Pfam 注释）
+        report = self.generate_report(entry_dirs, clusters, splits, output_dir)
+        # 附加 Pfam 信息到报告
+        if entry_pfam_map:
+            report["pfam_annotations"] = entry_pfam_map
+            report_path = os.path.join(output_dir, "dataset_report.json")
+            with open(report_path, 'w') as f:
+                json.dump(report, f, indent=2)
 
-        # 5. 打包
+        # 6. 打包
         self.package_dataset(splits, output_dir)
 
         return clusters, splits

@@ -1,13 +1,8 @@
 """
-标签可视化脚本
+标签可视化脚本 V3
 
-生成密度图与各层标注的切片对比图，用于目视检查标注质量
-支持输出：
-  1. 综合面板：密度图 + 5层标签在同一切面的对比
-  2. 多切面概览：沿3个轴的多个切面
-  3. 标注覆盖率统计
-  4. Voronoi vs Hard 标注对比
-  5. Before/After 覆盖率对比
+生成密度图与 V3 各层标注的切片对比图，用于目视检查标注质量
+V3 标签通道：Density / Segment / Atom / AA / SS / Q-score / Chain / Domain / Interface
 """
 import os
 import sys
@@ -21,15 +16,16 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
 import matplotlib.gridspec as gridspec
 
-# 标签颜色映射
-ATOM_NAMES = {0: 'bg', 1: 'CA', 2: 'N', 3: 'C', 4: 'O', 5: 'CB', 6: 'other'}
+# V3 标签名映射
+ATOM_NAMES = {0: 'bg', 1: 'CA', 2: 'C', 3: 'N', 4: 'O', 5: 'CB', 6: 'other'}
 AA_NAMES = {
     0: 'bg', 1: 'ALA', 2: 'ARG', 3: 'ASN', 4: 'ASP', 5: 'CYS',
     6: 'GLN', 7: 'GLU', 8: 'GLY', 9: 'HIS', 10: 'ILE',
     11: 'LEU', 12: 'LYS', 13: 'MET', 14: 'PHE', 15: 'PRO',
     16: 'SER', 17: 'THR', 18: 'TRP', 19: 'TYR', 20: 'VAL'
 }
-SS_NAMES = {0: 'bg', 1: 'coil', 2: 'helix', 3: 'strand'}
+# V3 二级结构重新编号
+SS_NAMES = {0: 'bg', 1: 'helix', 2: 'strand', 3: 'coil'}
 
 
 def load_mrc(path):
@@ -63,172 +59,180 @@ def make_discrete_cmap(n, name='tab20'):
 
 def plot_comprehensive_panel(entry_dir, output_path=None):
     """
-    综合面板：密度图 + 5层标签 + mol_map 在3个正交切面的对比
+    V3 综合面板：密度图 + 8层标签在3个正交切面的对比
+    通道：Density / Segment / Atom / AA / SS / Q-score / Chain / Domain / Interface
     """
     # 加载所有数据
     density, grid = load_mrc(os.path.join(entry_dir, "map_normalized.mrc"))
+
+    # V3 标签通道
+    label_segment, _ = load_mrc(os.path.join(entry_dir, "label_segment.mrc"))
     label_atom, _ = load_mrc(os.path.join(entry_dir, "label_atom.mrc"))
     label_aa, _ = load_mrc(os.path.join(entry_dir, "label_aa.mrc"))
     label_ss, _ = load_mrc(os.path.join(entry_dir, "label_ss.mrc"))
+    label_qscore, _ = load_mrc(os.path.join(entry_dir, "label_qscore.mrc"))
     label_chain, _ = load_mrc(os.path.join(entry_dir, "label_chain.mrc"))
-    label_conf, _ = load_mrc(os.path.join(entry_dir, "label_confidence.mrc"))
+
+    # domain/interface 可选（可能全零）
+    dom_path = os.path.join(entry_dir, "label_domain.mrc")
+    label_domain, _ = load_mrc(dom_path) if os.path.exists(dom_path) else (np.zeros_like(density), None)
+
+    iface_path = os.path.join(entry_dir, "label_interface.mrc")
+    label_interface, _ = load_mrc(iface_path) if os.path.exists(iface_path) else (np.zeros_like(density), None)
 
     mol_map_path = os.path.join(entry_dir, "mol_map.mrc")
     has_mol_map = os.path.exists(mol_map_path)
     if has_mol_map:
         mol_map, _ = load_mrc(mol_map_path)
 
-    sim_map_path = os.path.join(entry_dir, "sim_map.mrc")
-    has_sim_map = os.path.exists(sim_map_path)
-    if has_sim_map:
-        sim_map, _ = load_mrc(sim_map_path)
-
     # 找到信号中心
     center = find_signal_center(density)
     entry_name = os.path.basename(entry_dir)
 
     # 标签取整
+    label_segment = np.round(label_segment).astype(int)
     label_atom = np.round(label_atom).astype(int)
     label_aa = np.round(label_aa).astype(int)
     label_ss = np.round(label_ss).astype(int)
     label_chain = np.round(label_chain).astype(int)
+    label_domain = np.round(label_domain).astype(int)
+    label_interface = np.round(label_interface).astype(int)
 
-    # === 图1：XY 切面综合面板 ===
-    n_extra = int(has_mol_map) + int(has_sim_map)
-    ncols = 6 + n_extra
-    fig, axes = plt.subplots(3, ncols, figsize=(3.2 * ncols, 10))
-    fig.suptitle(f'{entry_name} - Label Visualization\n'
+    # V3 面板：9 列基础 + mol_map 可选
+    ncols = 9 + int(has_mol_map)
+    fig, axes = plt.subplots(3, ncols, figsize=(3.0 * ncols, 10))
+    fig.suptitle(f'{entry_name} - V3 Label Visualization\n'
                  f'Grid: {density.shape}, Spacing: {grid.spacing[0]:.3f}A',
                  fontsize=14, fontweight='bold')
 
-    slice_labels = ['XY (z={z})', 'XZ (y={y})', 'YZ (x={x})']
-    slices_density = [
-        density[:, :, center[2]],
-        density[:, center[1], :],
-        density[center[0], :, :],
-    ]
-    slices_atom = [
-        label_atom[:, :, center[2]],
-        label_atom[:, center[1], :],
-        label_atom[center[0], :, :],
-    ]
-    slices_aa = [
-        label_aa[:, :, center[2]],
-        label_aa[:, center[1], :],
-        label_aa[center[0], :, :],
-    ]
-    slices_ss = [
-        label_ss[:, :, center[2]],
-        label_ss[:, center[1], :],
-        label_ss[center[0], :, :],
-    ]
-    slices_chain = [
-        label_chain[:, :, center[2]],
-        label_chain[:, center[1], :],
-        label_chain[center[0], :, :],
-    ]
-    slices_conf = [
-        label_conf[:, :, center[2]],
-        label_conf[:, center[1], :],
-        label_conf[center[0], :, :],
-    ]
+    # 切片数据
+    def get_slices(vol):
+        return [vol[:, :, center[2]], vol[:, center[1], :], vol[center[0], :, :]]
 
+    slices_density = get_slices(density)
+    slices_segment = get_slices(label_segment)
+    slices_atom = get_slices(label_atom)
+    slices_aa = get_slices(label_aa)
+    slices_ss = get_slices(label_ss)
+    slices_qscore = get_slices(label_qscore)
+    slices_chain = get_slices(label_chain)
+    slices_domain = get_slices(label_domain)
+    slices_interface = get_slices(label_interface)
     if has_mol_map:
-        slices_mol = [
-            mol_map[:, :, center[2]],
-            mol_map[:, center[1], :],
-            mol_map[center[0], :, :],
-        ]
-    if has_sim_map:
-        slices_sim = [
-            sim_map[:, :, center[2]],
-            sim_map[:, center[1], :],
-            sim_map[center[0], :, :],
-        ]
+        slices_mol = get_slices(mol_map)
 
+    slice_labels = ['XY (z={z})', 'XZ (y={y})', 'YZ (x={x})']
+
+    # 颜色映射
+    seg_cmap = make_discrete_cmap(2, 'Set1')
     atom_cmap = make_discrete_cmap(7, 'tab10')
-    ss_cmap = make_discrete_cmap(4, 'Set1')
     n_chains = int(label_chain.max()) + 1
     chain_cmap = make_discrete_cmap(max(n_chains, 2), 'tab10')
     n_aa = int(label_aa.max()) + 1
     aa_cmap = make_discrete_cmap(max(n_aa, 2), 'tab20')
+    ss_cmap = make_discrete_cmap(4, 'Set1')
+    n_domains = int(label_domain.max()) + 1
+    domain_cmap = make_discrete_cmap(max(n_domains, 2), 'Set3')
+    iface_cmap = make_discrete_cmap(2, 'Set1')
 
     for row in range(3):
         col = 0
 
-        # 密度图
-        im = axes[row, col].imshow(slices_density[row].T, cmap='gray',
-                                    origin='lower', aspect='equal')
+        # 1. 密度图
+        axes[row, col].imshow(slices_density[row].T, cmap='gray',
+                               origin='lower', aspect='equal')
         if row == 0:
-            axes[row, col].set_title('Density', fontsize=10)
+            axes[row, col].set_title('Density', fontsize=9)
         axes[row, col].set_ylabel(slice_labels[row].format(
-            x=center[0], y=center[1], z=center[2]), fontsize=9)
+            x=center[0], y=center[1], z=center[2]), fontsize=8)
         col += 1
 
-        # 原子类型
-        im = axes[row, col].imshow(slices_density[row].T, cmap='gray',
-                                    origin='lower', aspect='equal', alpha=0.5)
+        # 2. Segment（蛋白/背景）
+        axes[row, col].imshow(slices_density[row].T, cmap='gray',
+                               origin='lower', aspect='equal', alpha=0.5)
+        axes[row, col].imshow(slices_segment[row].T, cmap=seg_cmap,
+                               origin='lower', aspect='equal',
+                               alpha=0.7, vmin=0, vmax=1)
+        if row == 0:
+            axes[row, col].set_title('Segment', fontsize=9)
+        col += 1
+
+        # 3. 原子类型
+        axes[row, col].imshow(slices_density[row].T, cmap='gray',
+                               origin='lower', aspect='equal', alpha=0.5)
         axes[row, col].imshow(slices_atom[row].T, cmap=atom_cmap,
                                origin='lower', aspect='equal',
                                alpha=0.7, vmin=0, vmax=6)
         if row == 0:
-            axes[row, col].set_title('Atom Type', fontsize=10)
+            axes[row, col].set_title('Atom Type', fontsize=9)
         col += 1
 
-        # 氨基酸类型
+        # 4. 氨基酸类型
         axes[row, col].imshow(slices_density[row].T, cmap='gray',
                                origin='lower', aspect='equal', alpha=0.5)
         axes[row, col].imshow(slices_aa[row].T, cmap=aa_cmap,
                                origin='lower', aspect='equal',
                                alpha=0.7, vmin=0, vmax=20)
         if row == 0:
-            axes[row, col].set_title('Amino Acid', fontsize=10)
+            axes[row, col].set_title('Amino Acid', fontsize=9)
         col += 1
 
-        # 二级结构
+        # 5. 二级结构
         axes[row, col].imshow(slices_density[row].T, cmap='gray',
                                origin='lower', aspect='equal', alpha=0.5)
         axes[row, col].imshow(slices_ss[row].T, cmap=ss_cmap,
                                origin='lower', aspect='equal',
                                alpha=0.7, vmin=0, vmax=3)
         if row == 0:
-            axes[row, col].set_title('Sec. Struct.', fontsize=10)
+            axes[row, col].set_title('Sec. Struct.', fontsize=9)
         col += 1
 
-        # 链
+        # 6. Q-score
+        axes[row, col].imshow(slices_density[row].T, cmap='gray',
+                               origin='lower', aspect='equal', alpha=0.3)
+        axes[row, col].imshow(slices_qscore[row].T, cmap='RdYlGn',
+                               origin='lower', aspect='equal',
+                               alpha=0.8, vmin=-1, vmax=1)
+        if row == 0:
+            axes[row, col].set_title('Q-score', fontsize=9)
+        col += 1
+
+        # 7. 链
         axes[row, col].imshow(slices_density[row].T, cmap='gray',
                                origin='lower', aspect='equal', alpha=0.5)
         axes[row, col].imshow(slices_chain[row].T, cmap=chain_cmap,
                                origin='lower', aspect='equal',
                                alpha=0.7, vmin=0, vmax=max(n_chains - 1, 1))
         if row == 0:
-            axes[row, col].set_title('Chain', fontsize=10)
+            axes[row, col].set_title('Chain', fontsize=9)
         col += 1
 
-        # 置信度
+        # 8. 结构域
         axes[row, col].imshow(slices_density[row].T, cmap='gray',
-                               origin='lower', aspect='equal', alpha=0.3)
-        axes[row, col].imshow(slices_conf[row].T, cmap='hot',
+                               origin='lower', aspect='equal', alpha=0.5)
+        axes[row, col].imshow(slices_domain[row].T, cmap=domain_cmap,
                                origin='lower', aspect='equal',
-                               alpha=0.8, vmin=0, vmax=1)
+                               alpha=0.7, vmin=0, vmax=max(n_domains - 1, 1))
         if row == 0:
-            axes[row, col].set_title('Confidence', fontsize=10)
+            axes[row, col].set_title('Domain', fontsize=9)
         col += 1
 
-        # mol_map（如果有）
+        # 9. 界面
+        axes[row, col].imshow(slices_density[row].T, cmap='gray',
+                               origin='lower', aspect='equal', alpha=0.5)
+        axes[row, col].imshow(slices_interface[row].T, cmap=iface_cmap,
+                               origin='lower', aspect='equal',
+                               alpha=0.7, vmin=0, vmax=1)
+        if row == 0:
+            axes[row, col].set_title('Interface', fontsize=9)
+        col += 1
+
+        # 10. mol_map（如果有）
         if has_mol_map:
             axes[row, col].imshow(slices_mol[row].T, cmap='inferno',
                                    origin='lower', aspect='equal')
             if row == 0:
-                axes[row, col].set_title('mol_map\n(denoise label)', fontsize=10)
-            col += 1
-
-        # sim_map（如果有）
-        if has_sim_map:
-            axes[row, col].imshow(slices_sim[row].T, cmap='inferno',
-                                   origin='lower', aspect='equal')
-            if row == 0:
-                axes[row, col].set_title('sim_map\n(QC simulated)', fontsize=10)
+                axes[row, col].set_title('mol_map', fontsize=9)
             col += 1
 
     # 去掉坐标轴刻度
@@ -242,77 +246,20 @@ def plot_comprehensive_panel(entry_dir, output_path=None):
         output_path = os.path.join(entry_dir, "vis_labels_panel.png")
     fig.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close(fig)
-    print(f"Panel saved: {output_path}")
+    print(f"V3 Panel saved: {output_path}")
 
-    # === 图2：多切面概览 ===
-    plot_multi_slices(density, label_atom, label_ss, label_conf, center,
-                      entry_name, entry_dir)
-
-    # === 图3：统计图 ===
-    plot_label_stats(entry_dir, label_atom, label_aa, label_ss,
-                     label_chain, label_conf, density, entry_name)
-
-    # === 图4：Voronoi vs Hard 标注对比 ===
-    plot_voronoi_comparison(density, label_atom, label_conf, center,
-                            entry_name, entry_dir)
+    # === 统计图 ===
+    plot_label_stats(entry_dir, label_segment, label_atom, label_aa, label_ss,
+                     label_qscore, label_chain, label_domain, label_interface,
+                     density, entry_name)
 
 
-def plot_multi_slices(density, label_atom, label_ss, label_conf,
-                      center, entry_name, entry_dir):
-    """沿 Z 轴等间距取多个切面，展示标注分布"""
-    nz = density.shape[2]
-    n_slices = 8
-    # 选择有信号的范围
-    z_signal = np.where(density.max(axis=(0, 1)) > 0.1)[0]
-    if len(z_signal) > 0:
-        z_start, z_end = z_signal[0], z_signal[-1]
-    else:
-        z_start, z_end = 0, nz - 1
-    z_indices = np.linspace(z_start, z_end, n_slices, dtype=int)
-
-    atom_cmap = make_discrete_cmap(7, 'tab10')
-
-    fig, axes = plt.subplots(3, n_slices, figsize=(2.5 * n_slices, 8))
-    fig.suptitle(f'{entry_name} - Z-axis Multi-slice (Density / Atom Label / Confidence)',
-                 fontsize=13, fontweight='bold')
-
-    for col, z in enumerate(z_indices):
-        # 密度
-        axes[0, col].imshow(density[:, :, z].T, cmap='gray',
-                             origin='lower', aspect='equal')
-        axes[0, col].set_title(f'z={z}', fontsize=9)
-
-        # 原子标签 overlay
-        axes[1, col].imshow(density[:, :, z].T, cmap='gray',
-                             origin='lower', aspect='equal', alpha=0.4)
-        axes[1, col].imshow(label_atom[:, :, z].T, cmap=atom_cmap,
-                             origin='lower', aspect='equal',
-                             alpha=0.8, vmin=0, vmax=6)
-
-        # 置信度
-        axes[2, col].imshow(label_conf[:, :, z].T, cmap='hot',
-                             origin='lower', aspect='equal', vmin=0, vmax=1)
-
-    for ax in axes.flat:
-        ax.set_xticks([])
-        ax.set_yticks([])
-
-    axes[0, 0].set_ylabel('Density', fontsize=10)
-    axes[1, 0].set_ylabel('Atom Label', fontsize=10)
-    axes[2, 0].set_ylabel('Confidence', fontsize=10)
-
-    plt.tight_layout()
-    out = os.path.join(entry_dir, "vis_multi_slices.png")
-    fig.savefig(out, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    print(f"Multi-slice overview saved: {out}")
-
-
-def plot_label_stats(entry_dir, label_atom, label_aa, label_ss,
-                     label_chain, label_conf, density, entry_name):
-    """标注统计图"""
-    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
-    fig.suptitle(f'{entry_name} - Label Statistics', fontsize=14, fontweight='bold')
+def plot_label_stats(entry_dir, label_segment, label_atom, label_aa, label_ss,
+                     label_qscore, label_chain, label_domain, label_interface,
+                     density, entry_name):
+    """V3 标注统计图"""
+    fig, axes = plt.subplots(2, 4, figsize=(20, 10))
+    fig.suptitle(f'{entry_name} - V3 Label Statistics', fontsize=14, fontweight='bold')
 
     # 1. 原子类型分布
     atom_counts = {}
@@ -344,7 +291,7 @@ def plot_label_stats(entry_dir, label_atom, label_aa, label_ss,
         axes[0, 1].set_ylabel('Voxel Count')
         axes[0, 1].tick_params(axis='x', rotation=45, labelsize=7)
 
-    # 3. 二级结构分布
+    # 3. 二级结构分布（V3 编号：helix=1, strand=2, coil=3）
     ss_counts = {}
     for val, name in SS_NAMES.items():
         if val == 0:
@@ -353,7 +300,7 @@ def plot_label_stats(entry_dir, label_atom, label_aa, label_ss,
         if cnt > 0:
             ss_counts[name] = cnt
     if ss_counts:
-        colors_ss = {'coil': '#2196F3', 'helix': '#F44336', 'strand': '#4CAF50'}
+        colors_ss = {'helix': '#F44336', 'strand': '#4CAF50', 'coil': '#2196F3'}
         axes[0, 2].bar(ss_counts.keys(), ss_counts.values(),
                         color=[colors_ss.get(k, 'gray') for k in ss_counts.keys()])
         axes[0, 2].set_title('Secondary Structure Distribution')
@@ -361,139 +308,92 @@ def plot_label_stats(entry_dir, label_atom, label_aa, label_ss,
         for i, (k, v) in enumerate(ss_counts.items()):
             axes[0, 2].text(i, v, str(v), ha='center', va='bottom', fontsize=8)
 
-    # 4. 置信度直方图（区分 Hard vs Voronoi）
-    conf_nonzero = label_conf[label_conf > 0]
-    if len(conf_nonzero) > 0:
-        # 高置信度区域（Hard标注）和低置信度区域（Voronoi标注）
-        conf_hard = conf_nonzero[conf_nonzero > 0.3]
-        conf_voronoi = conf_nonzero[conf_nonzero <= 0.3]
-
-        axes[1, 0].hist(conf_hard.flatten(), bins=30, color='coral', alpha=0.8,
-                         label=f'Hard (n={len(conf_hard)})')
-        if len(conf_voronoi) > 0:
-            axes[1, 0].hist(conf_voronoi.flatten(), bins=30, color='steelblue', alpha=0.6,
-                             label=f'Voronoi (n={len(conf_voronoi)})')
-        axes[1, 0].set_title(f'Confidence Distribution')
-        axes[1, 0].set_xlabel('Confidence')
-        axes[1, 0].set_ylabel('Voxel Count')
-        axes[1, 0].legend(fontsize=8)
+    # 4. Q-score 直方图
+    qs_nonzero = label_qscore[label_qscore != 0]
+    if len(qs_nonzero) > 0:
+        axes[0, 3].hist(qs_nonzero.flatten(), bins=50, color='teal', alpha=0.8)
+        axes[0, 3].set_title(f'Q-score Distribution (n={len(qs_nonzero)})')
+        axes[0, 3].set_xlabel('Q-score')
+        axes[0, 3].set_ylabel('Voxel Count')
+        axes[0, 3].axvline(np.median(qs_nonzero), color='red', linestyle='--',
+                            label=f'median={np.median(qs_nonzero):.2f}')
+        axes[0, 3].legend()
+    else:
+        axes[0, 3].text(0.5, 0.5, 'No Q-score data', ha='center', va='center',
+                          transform=axes[0, 3].transAxes)
 
     # 5. 标注覆盖率对比
     total = density.size
     signal = (density > 0.05).sum()
-    labeled = (label_atom > 0).sum()
-    high_conf = (label_conf > 0.3).sum()
-    low_conf = ((label_conf > 0) & (label_conf <= 0.3)).sum()
+    segment_labeled = (label_segment > 0).sum()
+    ca_labeled = (label_aa > 0).sum()
 
-    labels_bar = ['Total', 'Signal\n(>0.05)', 'All Labeled', 'Hard\n(conf>0.3)', 'Voronoi\n(conf<=0.3)']
-    values = [total, signal, labeled, high_conf, low_conf]
-    colors = ['gray', 'steelblue', 'coral', '#FF6B35', '#4ECDC4']
-    bars = axes[1, 1].bar(labels_bar, values, color=colors)
-    axes[1, 1].set_title('Coverage Breakdown')
-    axes[1, 1].set_ylabel('Voxel Count')
+    labels_bar = ['Total', 'Signal\n(>0.05)', 'Segment\n(protein)', 'CA-only\n(aa/ss/...)']
+    values = [total, signal, segment_labeled, ca_labeled]
+    colors = ['gray', 'steelblue', 'coral', '#FF6B35']
+    bars = axes[1, 0].bar(labels_bar, values, color=colors)
+    axes[1, 0].set_title('Coverage Breakdown')
+    axes[1, 0].set_ylabel('Voxel Count')
     for bar, val in zip(bars, values):
-        axes[1, 1].text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+        axes[1, 0].text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
                          f'{val}\n({100*val/total:.1f}%)',
                          ha='center', va='bottom', fontsize=7)
 
-    # 6. 链标签分布（显示多链信息）
+    # 6. 链标签分布
     chain_vals = label_chain[label_chain > 0]
     if len(chain_vals) > 0:
         unique_chains, chain_counts = np.unique(chain_vals, return_counts=True)
         if len(unique_chains) > 30:
-            # 太多链时只显示前 30
             top_idx = np.argsort(-chain_counts)[:30]
             unique_chains = unique_chains[top_idx]
             chain_counts = chain_counts[top_idx]
-        axes[1, 2].bar(range(len(unique_chains)), chain_counts, color='mediumpurple')
-        axes[1, 2].set_title(f'Chain Distribution ({len(unique_chains)} chains)')
-        axes[1, 2].set_xlabel('Chain ID')
-        axes[1, 2].set_ylabel('Voxel Count')
-        if len(unique_chains) <= 30:
-            axes[1, 2].set_xticks(range(len(unique_chains)))
-            axes[1, 2].set_xticklabels([str(c) for c in unique_chains], fontsize=6, rotation=45)
+        axes[1, 1].bar(range(len(unique_chains)), chain_counts, color='mediumpurple')
+        axes[1, 1].set_title(f'Chain Distribution ({len(unique_chains)} chains)')
+        axes[1, 1].set_xlabel('Chain ID')
+        axes[1, 1].set_ylabel('Voxel Count')
     else:
-        axes[1, 2].text(0.5, 0.5, 'No chain labels', ha='center', va='center',
-                          transform=axes[1, 2].transAxes)
+        axes[1, 1].text(0.5, 0.5, 'No chain labels', ha='center', va='center',
+                          transform=axes[1, 1].transAxes)
+
+    # 7. Domain 分布
+    dom_vals = label_domain[label_domain > 0]
+    if len(dom_vals) > 0:
+        unique_doms, dom_counts = np.unique(dom_vals, return_counts=True)
+        axes[1, 2].bar(range(len(unique_doms)), dom_counts,
+                        color='seagreen', tick_label=[str(int(d)) for d in unique_doms])
+        axes[1, 2].set_title(f'Domain Distribution ({len(unique_doms)} domains)')
+        axes[1, 2].set_xlabel('Domain ID')
+        axes[1, 2].set_ylabel('Voxel Count')
+    else:
+        axes[1, 2].text(0.5, 0.5, 'No domain labels\n(Merizo unavailable?)',
+                          ha='center', va='center', transform=axes[1, 2].transAxes)
+
+    # 8. Interface 统计
+    n_iface = int((label_interface > 0).sum())
+    n_non_iface = int((label_interface == 0).sum()) - int((label_segment == 0).sum())
+    n_non_iface = max(0, n_non_iface)
+    if n_iface > 0 or n_non_iface > 0:
+        labels_iface = ['Non-interface', 'Interface']
+        vals_iface = [n_non_iface, n_iface]
+        colors_iface = ['#4C72B0', '#C44E52']
+        axes[1, 3].bar(labels_iface, vals_iface, color=colors_iface)
+        axes[1, 3].set_title(f'Interface Detection')
+        axes[1, 3].set_ylabel('Voxel Count')
+        for i, v in enumerate(vals_iface):
+            axes[1, 3].text(i, v, str(v), ha='center', va='bottom', fontsize=8)
+    else:
+        axes[1, 3].text(0.5, 0.5, 'No interface data\n(single chain?)',
+                          ha='center', va='center', transform=axes[1, 3].transAxes)
 
     plt.tight_layout()
     out = os.path.join(entry_dir, "vis_label_stats.png")
     fig.savefig(out, dpi=150, bbox_inches='tight', facecolor='white')
     plt.close(fig)
-    print(f"Label stats saved: {out}")
-
-
-def plot_voronoi_comparison(density, label_atom, label_conf, center,
-                             entry_name, entry_dir):
-    """
-    Voronoi vs Hard 标注对比图
-
-    在同一切面上对比展示：
-    - 仅 Hard 标注区域（高置信度）
-    - 全部标注区域（Hard + Voronoi）
-    """
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    fig.suptitle(f'{entry_name} - Hard vs Voronoi Labeling Comparison',
-                 fontsize=14, fontweight='bold')
-
-    atom_cmap = make_discrete_cmap(7, 'tab10')
-
-    # 三个切面
-    slices_density = [
-        density[:, :, center[2]],
-        density[:, center[1], :],
-        density[center[0], :, :],
-    ]
-    slices_atom = [
-        label_atom[:, :, center[2]],
-        label_atom[:, center[1], :],
-        label_atom[center[0], :, :],
-    ]
-    slices_conf = [
-        label_conf[:, :, center[2]],
-        label_conf[:, center[1], :],
-        label_conf[center[0], :, :],
-    ]
-
-    slice_names = [f'XY (z={center[2]})', f'XZ (y={center[1]})', f'YZ (x={center[0]})']
-
-    for col in range(3):
-        # 第一行：仅 Hard 标注（置信度 > 0.3）
-        hard_mask = (slices_conf[col] > 0.3).astype(float)
-        hard_atoms = slices_atom[col] * (hard_mask > 0).astype(int)
-
-        axes[0, col].imshow(slices_density[col].T, cmap='gray',
-                             origin='lower', aspect='equal', alpha=0.5)
-        axes[0, col].imshow(hard_atoms.T, cmap=atom_cmap,
-                             origin='lower', aspect='equal',
-                             alpha=0.8, vmin=0, vmax=6)
-        if col == 0:
-            axes[0, col].set_ylabel('Hard Only\n(conf>0.3)', fontsize=11)
-        axes[0, col].set_title(slice_names[col], fontsize=10)
-
-        # 第二行：全部标注（Hard + Voronoi）
-        all_atoms = slices_atom[col]
-        axes[1, col].imshow(slices_density[col].T, cmap='gray',
-                             origin='lower', aspect='equal', alpha=0.5)
-        axes[1, col].imshow(all_atoms.T, cmap=atom_cmap,
-                             origin='lower', aspect='equal',
-                             alpha=0.8, vmin=0, vmax=6)
-        if col == 0:
-            axes[1, col].set_ylabel('Hard + Voronoi\n(all labeled)', fontsize=11)
-
-    for ax in axes.flat:
-        ax.set_xticks([])
-        ax.set_yticks([])
-
-    plt.tight_layout()
-    out = os.path.join(entry_dir, "vis_voronoi_comparison.png")
-    fig.savefig(out, dpi=150, bbox_inches='tight', facecolor='white')
-    plt.close(fig)
-    print(f"Voronoi comparison saved: {out}")
+    print(f"V3 Label stats saved: {out}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='标签可视化')
+    parser = argparse.ArgumentParser(description='V3 标签可视化')
     parser.add_argument('entry_dir', nargs='?',
                         help='条目目录路径，不指定则处理所有')
     parser.add_argument('--data-dir', default='data/raw',
@@ -511,12 +411,12 @@ def main():
         if not os.path.exists(os.path.join(entry_dir, "map_normalized.mrc")):
             print(f"跳过 {entry_dir}: 无 map_normalized.mrc")
             continue
-        if not os.path.exists(os.path.join(entry_dir, "label_atom.mrc")):
-            print(f"跳过 {entry_dir}: 无标签文件")
+        if not os.path.exists(os.path.join(entry_dir, "label_segment.mrc")):
+            print(f"跳过 {entry_dir}: 无 V3 标签文件")
             continue
 
         print(f"\n{'='*60}")
-        print(f"可视化: {entry_dir}")
+        print(f"V3 可视化: {entry_dir}")
         print(f"{'='*60}")
         plot_comprehensive_panel(entry_dir)
 

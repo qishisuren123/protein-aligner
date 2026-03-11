@@ -1,15 +1,16 @@
 #!/usr/bin/env python
 """
-Cryo-EM 数据处理管线 - 主运行脚本
+Cryo-EM 数据处理管线 V3 - 主运行脚本
 
 完整流程:
 1. Retrieval: 从 EMDB/RCSB 检索下载数据
 2. Resample: 重采样密度图到统一体素大小
 3. Normalization: 归一化密度值
-4. Alignment & QC: 对齐验证和质量控制
-5. Correspondence Labeling: 体素标注（原子/氨基酸/二级结构）
-6. Enhancement Labeling: 生成模拟密度图（去噪标签）
-7. Redundancy Removal & Packaging: 去冗余、划分数据集、打包
+4. Alignment & QC: 对齐验证和质量控制（含 Q-score 持久化）
+5. Domain Segmentation: Merizo 结构域分割（V3 新增）
+6. Correspondence Labeling: 体素标注（V3: 三 KDTree + CA-only + 8 通道）
+7. Enhancement Labeling: 生成模拟密度图（去噪标签）
+8. Redundancy Removal & Packaging: 去冗余、划分数据集、打包
 
 用法:
     python run_pipeline.py [--config configs/default.yaml] [--steps all]
@@ -30,6 +31,7 @@ from pipeline.retrieval import Retriever
 from pipeline.resample import Resampler
 from pipeline.normalization import Normalizer
 from pipeline.alignment_qc import AlignmentQC
+from pipeline.domain import DomainSegmenter
 from pipeline.correspondence import CorrespondenceLabeler
 from pipeline.enhancement import EnhancementLabeler
 from pipeline.redundancy import RedundancyRemover
@@ -50,7 +52,7 @@ def run_pipeline(config, steps='all'):
     """执行完整管线"""
     start_time = time.time()
     logger.info("=" * 60)
-    logger.info("Cryo-EM 数据处理管线启动")
+    logger.info("Cryo-EM 数据处理管线 V3 启动")
     logger.info("=" * 60)
 
     # 转为绝对路径
@@ -62,7 +64,7 @@ def run_pipeline(config, steps='all'):
     os.makedirs(config['paths']['output_dir'], exist_ok=True)
 
     all_steps = ['retrieval', 'resample', 'normalization', 'alignment_qc',
-                 'correspondence', 'enhancement', 'redundancy']
+                 'domain_segmentation', 'correspondence', 'enhancement', 'redundancy']
 
     if steps == 'all':
         run_steps = all_steps
@@ -131,7 +133,7 @@ def run_pipeline(config, steps='all'):
     # ========== Step 4: Alignment & QC ==========
     if 'alignment_qc' in run_steps:
         logger.info("\n" + "=" * 50)
-        logger.info("Step 4: Alignment & QC - 对齐与质量控制")
+        logger.info("Step 4: Alignment & QC - 对齐与质量控制 (含 Q-score 持久化)")
         logger.info("=" * 50)
         t0 = time.time()
 
@@ -141,43 +143,54 @@ def run_pipeline(config, steps='all'):
     else:
         passed_dirs = entry_dirs
 
-    # ========== Step 5: Correspondence Labeling ==========
+    # ========== Step 5: Domain Segmentation (V3 新增) ==========
+    if 'domain_segmentation' in run_steps:
+        logger.info("\n" + "=" * 50)
+        logger.info("Step 5: Domain Segmentation - Merizo 结构域分割")
+        logger.info("=" * 50)
+        t0 = time.time()
+
+        segmenter = DomainSegmenter(config)
+        segmenter.run(passed_dirs)
+        logger.info(f"Step 5 完成，耗时 {time.time()-t0:.1f}s")
+
+    # ========== Step 6: Correspondence Labeling ==========
     if 'correspondence' in run_steps:
         logger.info("\n" + "=" * 50)
-        logger.info("Step 5: Correspondence Labeling - 体素标注")
+        logger.info("Step 6: Correspondence Labeling - V3 体素标注 (三 KDTree + CA-only)")
         logger.info("=" * 50)
         t0 = time.time()
 
         labeler = CorrespondenceLabeler(config)
         labeler.run(passed_dirs)
-        logger.info(f"Step 5 完成，耗时 {time.time()-t0:.1f}s")
+        logger.info(f"Step 6 完成，耗时 {time.time()-t0:.1f}s")
 
-    # ========== Step 6: Enhancement Labeling ==========
+    # ========== Step 7: Enhancement Labeling ==========
     if 'enhancement' in run_steps:
         logger.info("\n" + "=" * 50)
-        logger.info("Step 6: Enhancement Labeling - 增强标注")
+        logger.info("Step 7: Enhancement Labeling - 增强标注")
         logger.info("=" * 50)
         t0 = time.time()
 
         enhancer = EnhancementLabeler(config)
         enhancer.run(passed_dirs)
-        logger.info(f"Step 6 完成，耗时 {time.time()-t0:.1f}s")
+        logger.info(f"Step 7 完成，耗时 {time.time()-t0:.1f}s")
 
-    # ========== Step 7: Redundancy Removal & Packaging ==========
+    # ========== Step 8: Redundancy Removal & Packaging ==========
     if 'redundancy' in run_steps:
         logger.info("\n" + "=" * 50)
-        logger.info("Step 7: Redundancy Removal & Packaging - 去冗余与打包")
+        logger.info("Step 8: Redundancy Removal & Packaging - 去冗余与打包 (含 Pfam)")
         logger.info("=" * 50)
         t0 = time.time()
 
         remover = RedundancyRemover(config)
         remover.run(passed_dirs, config['paths']['output_dir'])
-        logger.info(f"Step 7 完成，耗时 {time.time()-t0:.1f}s")
+        logger.info(f"Step 8 完成，耗时 {time.time()-t0:.1f}s")
 
     # ========== 总结 ==========
     total_time = time.time() - start_time
     logger.info("\n" + "=" * 60)
-    logger.info(f"管线执行完成！总耗时: {total_time:.1f}s ({total_time/60:.1f}min)")
+    logger.info(f"管线 V3 执行完成！总耗时: {total_time:.1f}s ({total_time/60:.1f}min)")
     logger.info(f"处理条目数: {len(entry_dirs)}")
     logger.info(f"通过 QC 条目数: {len(passed_dirs)}")
     logger.info(f"输出目录: {config['paths']['output_dir']}")
@@ -185,7 +198,7 @@ def run_pipeline(config, steps='all'):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Cryo-EM 数据处理管线')
+    parser = argparse.ArgumentParser(description='Cryo-EM 数据处理管线 V3')
     parser.add_argument('--config', type=str, default=None,
                         help='配置文件路径 (默认: configs/default.yaml)')
     parser.add_argument('--steps', type=str, default='all',

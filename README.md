@@ -1,98 +1,94 @@
-# Cryo-EM Map-Model Alignment Pipeline
+# Cryo-EM Map-Model Alignment Pipeline V3
 
-从 EMDB/RCSB 自动化下载冷冻电镜数据，生成用于深度学习训练的体素级标注数据集。
+面向 Cryo-EM Model Building 的多层级标注数据集生成管线。
 
-## 实测结果
+## V3 设计理念
 
-在 4 个测试条目上的实际运行结果（2026-03-09）：
+V3 针对 model building 任务进行了根本性重构：
 
-| 条目 | 类型 | 分辨率 | CC_mask | Q-score | 覆盖率 | 链数 | Tier |
-|------|------|--------|---------|---------|--------|------|------|
-| EMD-11638 / 7A4M | 蛋白质 (apoferritin 24聚体) | 1.22Å | **0.80** | **0.56** | **29.8%** | 24 | Gold |
-| EMD-31083 / 7EFC | 蛋白质 | 1.70Å | **0.79** | **0.86** | 4.3% | 4 | Gold |
-| EMD-62134 / 9K6S | 蛋白质-RNA 复合物 | 2.80Å | 0.29 | 0.46 | 16.3% | 3 | Hard |
-| EMD-38560 / 8XPS | 糖蛋白 | 3.22Å | **0.80** | **0.65** | 0.9% | 7 | Silver |
+- **CA-only 标注范式**: 语义标签（氨基酸、二级结构、链、结构域、界面）只在 CA 原子位置标注，减少噪声，聚焦残基级预测
+- **三组 KDTree 架构**: all-atom (segment/atom) + CA-only (aa/ss/chain/domain/interface) + backbone (qscore)
+- **蛋白质专注**: 移除 RNA/DNA/糖基/配体标注，专注 model building 核心需求
+- **物理级 Q-score**: 替代启发式高斯衰减置信度，使用 Pintilie 2020 原子级密度拟合指标
+- **Domain 标签**: Merizo 深度学习工具进行结构域分割
+- **Interface 标签**: CA-CA 跨链距离检测蛋白-蛋白界面
+- **Pfam Fold/Family Split**: HMMER+Pfam 做更严格的数据划分防止结构同源泄露
 
-> RNA 条目 CC_mask 偏低是因为模型仅占 map 局部区域，但 **RNA 体素成功检测** (protein=69万, RNA=19万体素)。糖蛋白条目成功检测 sugar 体素 (protein=8.5万, sugar=1.2万体素)。
+## V3 标签通道 (8 + 1)
 
-### 完成度
+| # | 文件 | 内容 | 标注范围 | 值域 |
+|---|------|------|---------|------|
+| 1 | `label_segment.mrc` | 蛋白/背景 | 所有信号体素 | 0=背景, 1=蛋白 |
+| 2 | `label_atom.mrc` | 原子类型 | 所有原子位置 | CA=1,C=2,N=3,O=4,CB=5,Other=6 |
+| 3 | `label_aa.mrc` | 氨基酸类型 | CA-only | 1-20 (标准 AA) |
+| 4 | `label_ss.mrc` | 二级结构 | CA-only | Helix=1,Strand=2,Coil=3 |
+| 5 | `label_qscore.mrc` | Q-score 置信度 | 骨架原子 | float [-1, 1] |
+| 6 | `label_chain.mrc` | 链 ID | CA-only | 1-N |
+| 7 | `label_domain.mrc` | 结构域 ID | CA-only | 1-M (Merizo) |
+| 8 | `label_interface.mrc` | 界面标签 | CA-only | 0=非界面, 1=界面 |
+| 9 | `mol_map.mrc` | 去噪模拟密度 | 所有体素 | float [0, 1] |
 
-| 功能模块 | 状态 | 说明 |
-|---------|------|------|
-| 数据检索与下载 | ✅ 完成 | RCSB Search API + EMDB FTP，含分辨率 metadata |
-| 密度图重采样 | ✅ 完成 | scipy.ndimage.zoom 到 1.0Å |
-| Robust Z-score 归一化 | ✅ 完成 | 中位数 + MAD，对异常值鲁棒 |
-| 生物学组装体展开 | ✅ 完成 | gemmi.make_assembly()，apoferritin 3k→76k 原子 |
-| DensityCalculatorX 模拟密度 | ✅ 完成 | 5 高斯散射因子，CC_mask=0.80 |
-| 三项 CC 指标 | ✅ 完成 | CC_mask / CC_volume / CC_overall |
-| Q-score 物理置信度 | ✅ 完成 | Pintilie 2020，Fibonacci sphere 40方向径向采样 |
-| 双层体素标注 (Hard + Voronoi) | ✅ 完成 | 覆盖率从 <1% 提升到 30% |
-| 多分子类型标注 | ✅ 完成 | protein/RNA/DNA/sugar/ligand 自动检测 |
-| 核苷酸 + 糖基标签扩展 | ✅ 完成 | 氨基酸(1-20) + 核苷酸(21-28) + 糖基(29-34) |
-| RNA/DNA 二级结构 | ✅ 完成 | sugar_phosphate / base 原子级分类 |
-| 自适应分辨率 blur | ✅ 完成 | blur = b_factor × (resolution / 2.0) |
-| Gold/Silver/Hard 数据分层 | ✅ 完成 | 基于 resolution + CC_mask + Q-score |
-| MMseqs2 序列聚类 | ✅ 完成 | 自动下载静态二进制，回退 3-mer Jaccard |
-| train/val/test 划分 | ✅ 完成 | 按序列聚类划分，防止数据泄露 |
-| 数据集可视化 | ✅ 完成 | 6 子图发表级概览 |
-| 蛋白质 demo | ✅ 验证通过 | 2 条目，CC_mask > 0.79，Q-score > 0.56 |
-| 蛋白质-RNA demo | ✅ 验证通过 | RNA 体素检测成功 (19万体素)，CC_volume=0.58 |
-| 糖蛋白 demo | ✅ 验证通过 | sugar 体素检测成功 (1.2万体素)，CC_mask=0.80 |
+### 相比 V2 的变化
 
-## 管线流程
+| V2 | V3 | 变化原因 |
+|----|----|----|
+| `label_confidence.mrc` (高斯衰减) | `label_qscore.mrc` (物理 Q-score) | 物理级原子置信度替代启发式 |
+| `label_moltype.mrc` (5类分子类型) | 删除 | 蛋白专注，无需多分子类型 |
+| 无 | `label_segment.mrc` | 新增蛋白/背景二值分割标签 |
+| 无 | `label_domain.mrc` | 新增结构域分割 |
+| 无 | `label_interface.mrc` | 新增蛋白-蛋白界面检测 |
+| 所有原子同一 KDTree | 三组 KDTree | CA-only 减少噪声，语义标签更准确 |
+| Voronoi 默认开启 | Voronoi 默认关闭 | CA-only 标签无需扩展覆盖 |
+
+## 管线流程 (8 步)
 
 ```
-1. Retrieval     — RCSB Search API 查询 + EMDB/RCSB 下载（含分辨率 metadata）
-2. Resample      — scipy.ndimage.zoom 重采样到统一体素大小 (1.0Å)
-3. Normalization — Robust z-score 归一化到 [0, 1]
-4. Alignment QC  — DensityCalculatorX 模拟密度 + CC 三项指标 + Q-score
-5. Correspondence— 生物组装体展开 + 6 层体素标注 + 多分子类型 + Voronoi
-6. Enhancement   — DensityCalculatorX 自适应 blur 生成去噪训练标签 (mol_map)
-7. Redundancy    — MMseqs2/3-mer 聚类 + Gold/Silver/Hard 分层 + train/val/test 划分
+1. Retrieval        — RCSB/EMDB 下载
+2. Resample         — 重采样到 1.0Å
+3. Normalization    — Robust z-score
+4. Alignment QC     — CC 指标 + Q-score 持久化
+5. Domain Seg.      — Merizo 结构域分割（新增）
+6. Correspondence   — 三 KDTree + CA-only + 8 层体素标注
+7. Enhancement      — 自适应 blur mol_map
+8. Redundancy       — MMseqs2 + Pfam Fold/Family Split
 ```
 
 ## 核心技术
 
-### 生物学组装体展开
-通过 `gemmi.make_assembly()` 将不对称单元展开为完整生物学组装体。Apoferritin 从 3,067 原子（1 链）展开到 73,608 原子（24 链），使标注覆盖完整密度。
+### 三组 KDTree 架构
 
-### 物理级模拟密度
-使用 `gemmi.DensityCalculatorX`（5 高斯近似原子散射因子），CC_mask 从手写三线性+高斯模糊的 0.40 提升到 **0.80**。
-
-### 双层标注策略
-- **Hard 层**: 距离阈值内（≤3Å），高斯衰减置信度，高置信度
-- **Voronoi 层**: 距离阈值外，最近邻赋值，置信度上限 0.3
-- 效果: 标注覆盖率从 <1% 提升到 **29.8%**
+| KDTree | 源原子 | 产出标签 |
+|--------|--------|---------|
+| `tree_all` | 所有蛋白原子 | `label_segment`(距离内=1), `label_atom`(原子类型) |
+| `tree_ca` | 仅 CA 原子 | `label_aa`, `label_ss`, `label_chain`, `label_domain`, `label_interface` |
+| `tree_backbone` | CA/C/N/O/CB | `label_qscore`(从 qscores.json 读取 Q-score 值) |
 
 ### Q-score (Pintilie et al., Nature Methods 2020)
-cryo-EM 标准的原子级密度拟合质量指标：
-1. 对每个原子，沿 40 个径向方向（Fibonacci sphere）采样实验密度
-2. 采样范围 0~2Å，步长 0.1Å
-3. 与参考高斯 `exp(-d²/(2σ²))` (σ=0.6Å) 做 Pearson 相关
-4. 返回 [-1, 1]，越接近 1 表示匹配越好
 
-### 多分子类型标注
-通过 `gemmi.find_tabulated_residue().kind` 自动检测：
+- 对每个原子，沿 40 个径向方向 (Fibonacci sphere) 采样实验密度
+- 采样范围 0~2Å，步长 0.1Å
+- 与参考高斯 `exp(-d²/(2σ²))` (σ=0.6Å) 做 Pearson 相关
+- 返回 [-1, 1]，越接近 1 匹配越好
+- Step 4 保存逐原子 Q-score 到 `qscores.json`，Step 6 读取生成 `label_qscore.mrc`
 
-| 分子类型 | 标签值 | 检测方法 |
-|----------|--------|----------|
-| Protein | 1 | `ResidueKind.AA` |
-| RNA | 2 | `ResidueKind.RNA` |
-| DNA | 3 | `ResidueKind.DNA` |
-| Sugar | 4 | `ResidueKind.PYR` + 糖基残基名匹配 |
-| Ligand | 5 | 其他非水小分子 |
+### Domain Segmentation (Merizo)
 
-残基标签扩展：氨基酸 (1-20) + 核苷酸 (21-28: A/U/G/C/DA/DT/DG/DC) + 糖基 (29-34: NAG/MAN/BMA/FUC/GAL/SIA)
+- 基于深度学习的蛋白质结构域分割
+- 在原始结构上运行，通过残基序号复制到展开后的对称链
+- 回退策略：Merizo 不可用时 `label_domain.mrc` 全零，管线不中断
 
-二级结构扩展：蛋白质 coil/helix/strand + RNA/DNA sugar_phosphate/base
+### Interface Detection
 
-### 数据质量分层
+- 基于 CA-CA 跨链距离 (阈值 5.0Å)
+- 每条链建 cKDTree，批量查询其他链的最近距离
+- 高效处理多链蛋白（如 apoferritin 24 聚体）
 
-| 层级 | 条件 | 用途 |
-|------|------|------|
-| Gold | resolution < 2.5Å AND cc_mask > 0.7 AND q_score > 0.5 | 高质量训练集 |
-| Silver | resolution < 3.5Å AND cc_mask > 0.5 | 一般训练集 |
-| Hard | 其余通过 QC 的条目 | 困难样本 |
+### Pfam Fold/Family Split
+
+- HMMER `hmmscan` 搜索 Pfam-A 数据库
+- 共享 Pfam family 的条目归入同一组
+- 按 Pfam 分组做 train/val/test 划分，防止结构同源泄露
+- 回退：Pfam 不可用时自动使用 MMseqs2 序列聚类
 
 ## 快速开始
 
@@ -104,10 +100,17 @@ conda activate cryo-pipeline
 pip install gemmi mrcfile biopython scipy numpy requests tqdm pyyaml matplotlib
 ```
 
+### 安装外部工具（可选）
+
+```bash
+# 安装 Merizo + HMMER + Pfam-A（需要代理时先设置）
+bash scripts/install_tools.sh
+```
+
 ### 运行测试
 
 ```bash
-# 下载 4 个测试条目并跑通全流程（约 5 分钟）
+# 下载 4 个测试条目并跑通全流程
 python test_pipeline.py
 
 # 生成数据集概览图
@@ -121,13 +124,13 @@ python visualize_labels.py
 
 ```bash
 python run_pipeline.py                          # 默认配置，下载 5 个条目
-python run_pipeline.py --steps all              # 全部步骤
-python run_pipeline.py --steps correspondence,enhancement  # 只跑后续步骤
+python run_pipeline.py --steps all              # 全部 8 步
+python run_pipeline.py --steps domain_segmentation,correspondence,enhancement  # 只跑部分步骤
 ```
 
 ## 输出结构
 
-每个条目产出 15 个文件：
+每个条目产出 18 个文件：
 
 ```
 data/raw/EMD-XXXXX_YYYY/
@@ -137,23 +140,27 @@ data/raw/EMD-XXXXX_YYYY/
 ├── sim_map.mrc           # QC 用模拟密度图
 ├── mol_map.mrc           # 去噪训练标签（自适应 blur）
 ├── model.cif             # 原子模型
-├── label_atom.mrc        # 原子类型 (CA=1, N=2, C=3, O=4, CB=5, other=6)
-├── label_aa.mrc          # 残基类型 (AA 1-20, 核苷酸 21-28, 糖基 29-34)
-├── label_ss.mrc          # 二级结构 (coil/helix/strand/sugar_phosphate/base)
-├── label_chain.mrc       # 链 ID
-├── label_confidence.mrc  # 置信度 (Hard 高置信 + Voronoi 低置信)
-├── label_moltype.mrc     # 分子类型 (protein/RNA/DNA/sugar/ligand)
-├── qc_metrics.json       # CC_mask, CC_volume, CC_overall, Q-score
-├── labeling_stats.json   # 覆盖率统计 + 分子类型计数
+├── label_segment.mrc     # 蛋白/背景 (0/1)
+├── label_atom.mrc        # 原子类型 (CA=1, C=2, N=3, O=4, CB=5, Other=6)
+├── label_aa.mrc          # 氨基酸类型 (1-20)，CA-only
+├── label_ss.mrc          # 二级结构 (Helix=1, Strand=2, Coil=3)，CA-only
+├── label_qscore.mrc      # Q-score 置信度 (float)，骨架原子
+├── label_chain.mrc       # 链 ID (1-N)，CA-only
+├── label_domain.mrc      # 结构域 ID (1-M)，CA-only
+├── label_interface.mrc   # 界面标签 (0/1)，CA-only
+├── qscores.json          # 逐原子 Q-score
+├── domain_assignment.json # 结构域分割结果
+├── qc_metrics.json       # CC + Q-score 指标
+├── labeling_stats.json   # V3 标注统计
 └── metadata.json         # PDB/EMDB ID, 分辨率
 ```
 
 打包输出：
 ```
 data/output/
-├── train/ val/ test/       # 按序列聚类划分（防数据泄露）
-├── dataset_report.json     # 全量报告（含 tier 分层）
-└── dataset_overview.png    # 6 子图数据集概览
+├── train/ val/ test/       # 按 Pfam/序列聚类划分（防同源泄露）
+├── dataset_report.json     # 全量报告（含 tier 分层 + Pfam 注释）
+└── dataset_overview.png    # V3 数据集概览
 ```
 
 ## 配置
@@ -162,26 +169,36 @@ data/output/
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `bio_assembly.enabled` | true | 生物组装体展开 |
-| `alignment_qc.dc_blur` | 0 | DensityCalculatorX blur (0 最优) |
-| `qscore.sigma` | 0.6 | Q-score 参考高斯宽度 (Å) |
-| `correspondence.molecule_types.enabled` | true | 多分子类型标注 |
-| `correspondence.use_voronoi` | true | Voronoi 全覆盖 |
-| `enhancement.adaptive_blur` | true | 按分辨率自适应 blur |
-| `redundancy.use_mmseqs2` | true | MMseqs2 聚类 |
+| `domain_segmentation.enabled` | true | Merizo 结构域分割 |
+| `correspondence.use_voronoi` | false | V3 默认关闭 Voronoi |
+| `correspondence.interface.distance_threshold` | 5.0 | CA-CA 跨链界面阈值 (Å) |
+| `redundancy.pfam.enabled` | true | Pfam Fold/Family Split |
 
-## 已知限制
+## 数据质量分层
 
-- 部分 mmCIF 文件的 unit cell 为默认值 (1,1,1)，DensityCalculatorX 会产生 NaN（已自动清除）
-- RNA 复合物条目中模型仅占 map 局部区域时，CC_mask 偏低（CC_volume 更可靠）
-- 超大密度图（>400³）的 Q-score 计算较慢（逐原子 Python 循环）
+| 层级 | 条件 | 用途 |
+|------|------|------|
+| Gold | resolution < 2.5Å AND cc_mask > 0.7 AND q_score > 0.5 | 高质量训练集 |
+| Silver | resolution < 3.5Å AND cc_mask > 0.5 | 一般训练集 |
+| Hard | 其余通过 QC 的条目 | 困难样本 |
+
+## 风险与回退
+
+| 风险 | 回退方案 |
+|------|---------|
+| Merizo 安装失败 | `label_domain.mrc` 全零，管线继续 |
+| Pfam-A 下载失败 | 回退到 MMseqs2 聚类 split |
+| PyTorch CPU 安装失败 | Merizo 不可用，domain 全零 |
+| hmmscan 不可用 | 回退到 MMseqs2 |
 
 ## 依赖
 
 - Python 3.10+
-- gemmi >= 0.7.0 — 结构解析、密度计算、坐标变换
-- scipy — 重采样、KDTree、统计
+- gemmi >= 0.7.0 — 结构解析、密度计算
+- scipy — KDTree、重采样
 - numpy — 向量化计算
 - requests, tqdm — 数据下载
 - matplotlib — 可视化
 - MMseqs2 — 序列聚类（可选，自动下载）
+- PyTorch CPU — Merizo 依赖（可选）
+- HMMER — Pfam 搜索（可选）
