@@ -29,7 +29,7 @@ class DomainSegmenter:
 
     def _check_merizo(self):
         """检查 Merizo 是否可用"""
-        predict_script = os.path.join(self.merizo_path, 'predict.py')
+        predict_script = os.path.abspath(os.path.join(self.merizo_path, 'predict.py'))
         if not os.path.exists(predict_script):
             logger.warning(f"  Merizo 不可用: {predict_script} 不存在")
             return False
@@ -54,23 +54,28 @@ class DomainSegmenter:
         """
         运行 Merizo 结构域分割
 
+        Merizo 输出在 {pdb_path_without_ext}_merizo_v2/ 目录下
+        使用 --save_domains 保存 domain PDB，--return_indices 保存残基索引
+
         返回:
-            output_file: Merizo 输出文件路径，失败返回 None
+            output_file: Merizo 输出目录路径，失败返回 None
         """
-        predict_script = os.path.join(self.merizo_path, 'predict.py')
+        predict_script = os.path.abspath(os.path.join(self.merizo_path, 'predict.py'))
+        merizo_dir = os.path.abspath(self.merizo_path)
 
         cmd = [
             'python', predict_script,
             '-d', self.device,
             '-i', pdb_path,
-            '--output_dir', output_dir,
+            '--save_domains',
+            '--return_indices',
         ]
 
         logger.info(f"  运行 Merizo: {' '.join(cmd)}")
         try:
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=600,
-                cwd=self.merizo_path,
+                cwd=merizo_dir,
             )
             if proc.returncode != 0:
                 logger.warning(f"  Merizo 运行失败 (returncode={proc.returncode})")
@@ -78,8 +83,15 @@ class DomainSegmenter:
                     logger.warning(f"  stderr: {proc.stderr[:500]}")
                 return None
 
-            logger.info(f"  Merizo 运行完成")
-            return output_dir
+            # Merizo 输出目录: {pdb_path_without_ext}_merizo_v2/
+            pdb_bn = os.path.splitext(pdb_path)[0]
+            merizo_out = pdb_bn + "_merizo_v2"
+
+            # 解析 stdout 获取 chopping 信息
+            stdout_text = proc.stdout.strip() if proc.stdout else ""
+            logger.info(f"  Merizo stdout: {stdout_text[:200]}")
+
+            return merizo_out
 
         except subprocess.TimeoutExpired:
             logger.warning("  Merizo 运行超时 (>600s)")
@@ -92,8 +104,8 @@ class DomainSegmenter:
         """
         解析 Merizo 输出文件
 
-        Merizo 输出格式：在 output_dir 下生成以输入 PDB 名字命名的文件
-        主要输出为 chopping 信息和 domain PDB 文件
+        优先解析 .idx 文件（格式: residue_num:domain_id,...）
+        回退到 domain PDB 文件
 
         返回:
             domain_map: {(chain, resseq): domain_id} 映射
@@ -103,49 +115,85 @@ class DomainSegmenter:
         domain_map = {}
         domain_boundaries = {}
 
-        # Merizo 输出：查找 segment 文件或 chopping 文件
-        # Merizo v2 在输出目录中生成 <name>_segments.txt 或类似文件
-        # 也可能生成多个 domain PDB 文件: <name>_domain_0.pdb 等
-        import glob as globmod
+        # 方式1：解析 .idx 文件（最可靠）
+        idx_path = output_dir + ".idx"
+        if os.path.exists(idx_path):
+            try:
+                with open(idx_path) as f:
+                    content = f.read().strip()
+                if content:
+                    # 格式: "resnum:domid,resnum:domid,..."
+                    # resnum 是残基序号，domid 是 domain ID（0=未分配）
+                    dom_ranges = {}  # dom_id -> [resseq, ...]
+                    for pair in content.split(','):
+                        pair = pair.strip()
+                        if ':' not in pair:
+                            continue
+                        resnum_str, domid_str = pair.split(':')
+                        resseq = int(float(resnum_str))
+                        domid = int(float(domid_str))
+                        if domid == 0:
+                            continue  # 未分配的残基
+                        # Merizo 只处理单链（默认 chain A），使用 "A" 作为链名
+                        domain_map[("A", resseq)] = domid
+                        if domid not in dom_ranges:
+                            dom_ranges[domid] = []
+                        dom_ranges[domid].append(resseq)
 
-        # 方式1：解析 domain PDB 文件
-        domain_pdbs = sorted(globmod.glob(os.path.join(output_dir, f"*domain*.pdb")))
-        if not domain_pdbs:
-            # 方式2：查找所有非输入 PDB 文件
-            domain_pdbs = sorted(globmod.glob(os.path.join(output_dir, "*.pdb")))
-            domain_pdbs = [p for p in domain_pdbs if pdb_name not in os.path.basename(p)]
-
-        if domain_pdbs:
-            import gemmi
-            for dom_idx, pdb_file in enumerate(domain_pdbs, start=1):
-                try:
-                    st = gemmi.read_structure(pdb_file)
-                    model = st[0]
-                    res_start = None
-                    res_end = None
-                    chain_name = None
-                    for chain in model:
-                        chain_name = chain.name
-                        for residue in chain:
-                            resseq = residue.seqid.num
-                            domain_map[(chain_name, resseq)] = dom_idx
-                            if res_start is None or resseq < res_start:
-                                res_start = resseq
-                            if res_end is None or resseq > res_end:
-                                res_end = resseq
-
-                    if chain_name and res_start is not None:
-                        domain_boundaries[str(dom_idx)] = {
-                            "chain": chain_name,
-                            "start": res_start,
-                            "end": res_end,
+                    # 构建边界信息
+                    for dom_id, residues in dom_ranges.items():
+                        domain_boundaries[str(dom_id)] = {
+                            "chain": "A",
+                            "start": min(residues),
+                            "end": max(residues),
+                            "n_residues": len(residues),
                         }
-                except Exception as e:
-                    logger.warning(f"  解析 domain PDB 失败 {pdb_file}: {e}")
+                    n_domains = len(set(domain_map.values())) if domain_map else 0
+                    logger.info(f"  Merizo .idx 解析: {n_domains} 个结构域, {len(domain_map)} 个残基")
+                    return domain_map, n_domains, domain_boundaries
+            except Exception as e:
+                logger.warning(f"  .idx 文件解析失败: {e}")
+
+        # 方式2：解析 domain PDB 文件
+        import glob as globmod
+        if os.path.isdir(output_dir):
+            domain_pdbs = sorted(globmod.glob(os.path.join(output_dir, f"*domain*.pdb")))
+            if not domain_pdbs:
+                domain_pdbs = sorted(globmod.glob(os.path.join(output_dir, "*.pdb")))
+                domain_pdbs = [p for p in domain_pdbs if pdb_name not in os.path.basename(p)]
+
+            if domain_pdbs:
+                import gemmi
+                for dom_idx, pdb_file in enumerate(domain_pdbs, start=1):
+                    try:
+                        st = gemmi.read_structure(pdb_file)
+                        model = st[0]
+                        res_start = None
+                        res_end = None
+                        chain_name = None
+                        for chain in model:
+                            chain_name = chain.name
+                            for residue in chain:
+                                resseq = residue.seqid.num
+                                domain_map[(chain_name, resseq)] = dom_idx
+                                if res_start is None or resseq < res_start:
+                                    res_start = resseq
+                                if res_end is None or resseq > res_end:
+                                    res_end = resseq
+
+                        if chain_name and res_start is not None:
+                            domain_boundaries[str(dom_idx)] = {
+                                "chain": chain_name,
+                                "start": res_start,
+                                "end": res_end,
+                            }
+                    except Exception as e:
+                        logger.warning(f"  解析 domain PDB 失败 {pdb_file}: {e}")
 
         # 方式3：解析文本输出（chopping 格式）
         if not domain_map:
-            txt_files = globmod.glob(os.path.join(output_dir, "*.txt"))
+            import glob as globmod
+            txt_files = globmod.glob(os.path.join(output_dir, "*.txt")) if os.path.isdir(output_dir) else []
             for txt_file in txt_files:
                 try:
                     domain_map, domain_boundaries = self._parse_chopping_file(txt_file)
@@ -252,19 +300,17 @@ class DomainSegmenter:
                 pdb_path = os.path.join(tmpdir, "input.pdb")
                 self._cif_to_pdb(model_path, pdb_path)
 
-                # 2. 运行 Merizo
-                merizo_out = os.path.join(tmpdir, "merizo_output")
-                os.makedirs(merizo_out, exist_ok=True)
-                result = self._run_merizo(pdb_path, merizo_out)
+                # 2. 运行 Merizo（输出路径由 Merizo 自动生成在 pdb 文件旁边）
+                merizo_out = self._run_merizo(pdb_path, tmpdir)
 
-                if result is None:
+                if merizo_out is None:
                     logger.warning(f"  Merizo 运行失败，使用空映射")
                     empty_result["method"] = "fallback_merizo_failed"
                     with open(output_path, 'w') as f:
                         json.dump(empty_result, f, indent=2)
                     return empty_result
 
-                # 3. 解析输出
+                # 3. 解析输出（merizo_out = {pdb_without_ext}_merizo_v2）
                 domain_map, n_domains, boundaries = self._parse_merizo_output(
                     merizo_out, "input"
                 )

@@ -3,7 +3,7 @@
 
 功能：
 - 从原子模型生成模拟密度图（低噪声），作为去噪训练标签
-- 使用 gemmi.DensityCalculatorX 替代手写三线性插值
+- 使用 gemmi.DensityCalculatorE 替代手写三线性插值（电子散射因子）
 - 支持生物学组装体展开
 - 从 metadata 读取分辨率，用 b_factor 控制模糊程度
 """
@@ -47,9 +47,9 @@ class EnhancementLabeler:
 
     def generate_mol_map(self, entry_dir):
         """
-        使用 DensityCalculatorX 生成模拟密度图 mol_map.mrc
+        使用 DensityCalculatorE 生成模拟密度图 mol_map.mrc
 
-        使用物理散射因子，通过 b_factor 控制平滑程度
+        使用电子散射因子，通过 b_factor 控制平滑程度
         """
         map_path = os.path.join(entry_dir, "map_normalized.mrc")
         model_path = os.path.join(entry_dir, "model.cif")
@@ -86,7 +86,7 @@ class EnhancementLabeler:
         # 获取分辨率
         resolution = self._get_resolution(entry_dir)
 
-        # 使用 DensityCalculatorX 生成密度
+        # 使用 DensityCalculatorE 生成密度（电子散射因子，适合 cryo-EM）
         # blur = b_factor 来控制模拟密度的平滑度
         # 自适应模式：按分辨率缩放，高分辨率保留更多细节
         if self.adaptive_blur:
@@ -96,7 +96,7 @@ class EnhancementLabeler:
         else:
             blur = self.b_factor
 
-        dc = gemmi.DensityCalculatorX()
+        dc = gemmi.DensityCalculatorE()
         dc.d_min = resolution
         dc.blur = blur
         dc.grid.set_unit_cell(cell)
@@ -106,20 +106,20 @@ class EnhancementLabeler:
         dc.put_model_density_on_grid(model)
         mol_data = np.array(dc.grid, copy=True)
 
-        # 清除 NaN（DCX 偶尔产生极少量 NaN，会在 zoom 插值时传播）
+        # 清除 NaN（DCE 偶尔产生极少量 NaN，会在 zoom 插值时传播）
         nan_count = np.isnan(mol_data).sum()
         if nan_count > 0:
             logger.info(f"  清除 {nan_count} 个 NaN 值")
             mol_data = np.nan_to_num(mol_data, nan=0.0)
 
-        # DensityCalculatorX 可能自动调整 grid 尺寸，需要重采样
+        # DensityCalculatorE 可能自动调整 grid 尺寸，需要重采样
         target_shape = (nu, nv, nw)
         if mol_data.shape != target_shape:
             logger.info(f"  DC grid {mol_data.shape} -> 重采样到 {target_shape}")
             zoom_factors = tuple(t / s for t, s in zip(target_shape, mol_data.shape))
             mol_data = zoom(mol_data, zoom_factors, order=3)
 
-        logger.info(f"  DensityCalculatorX: {n_atoms} 原子, "
+        logger.info(f"  DensityCalculatorE: {n_atoms} 原子, "
                     f"resolution={resolution:.2f}Å, blur={blur:.1f}")
 
         # 归一化

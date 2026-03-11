@@ -298,10 +298,11 @@ class RedundancyRemover:
 
     def classify_tier(self, entry_dir):
         """
-        根据数据质量将条目分为 Gold/Silver/Hard 三级
+        根据数据质量将条目分为 Gold/Silver/Copper/Hard 四级（V3.1 更新）
 
-        Gold:   resolution < 2.5Å AND cc_mask > 0.7 AND q_score_mean > 0.5
-        Silver: resolution < 3.5Å AND cc_mask > 0.5
+        Gold:   resolution < 2.5Å AND cc_mask > 0.80 AND q_score_mean > 0.60
+        Silver: resolution < 4.0Å AND cc_mask > 0.70 AND q_score_mean > 0.40
+        Copper: cc_mask > 0.60 AND q_score_mean > 0.20
         Hard:   其余通过 QC 的条目
         """
         qc_path = os.path.join(entry_dir, "qc_metrics.json")
@@ -318,18 +319,25 @@ class RedundancyRemover:
         # 可配置阈值
         gold_cfg = self.tier_cfg.get('gold', {})
         silver_cfg = self.tier_cfg.get('silver', {})
+        copper_cfg = self.tier_cfg.get('copper', {})
 
         gold_res = gold_cfg.get('max_resolution', 2.5)
-        gold_cc = gold_cfg.get('min_cc_mask', 0.7)
-        gold_qs = gold_cfg.get('min_qscore', 0.5)
+        gold_cc = gold_cfg.get('min_cc_mask', 0.80)
+        gold_qs = gold_cfg.get('min_qscore', 0.60)
 
-        silver_res = silver_cfg.get('max_resolution', 3.5)
-        silver_cc = silver_cfg.get('min_cc_mask', 0.5)
+        silver_res = silver_cfg.get('max_resolution', 4.0)
+        silver_cc = silver_cfg.get('min_cc_mask', 0.70)
+        silver_qs = silver_cfg.get('min_qscore', 0.40)
+
+        copper_cc = copper_cfg.get('min_cc_mask', 0.60)
+        copper_qs = copper_cfg.get('min_qscore', 0.20)
 
         if resolution < gold_res and cc_mask > gold_cc and q_score_mean > gold_qs:
             return "gold"
-        elif resolution < silver_res and cc_mask > silver_cc:
+        elif resolution < silver_res and cc_mask > silver_cc and q_score_mean > silver_qs:
             return "silver"
+        elif cc_mask > copper_cc and q_score_mean > copper_qs:
+            return "copper"
         else:
             return "hard"
 
@@ -374,7 +382,7 @@ class RedundancyRemover:
     def generate_report(self, entry_dirs, clusters, splits, output_dir):
         """生成数据集统计报告（含 tier 分层信息）"""
         # 数据分层统计
-        tier_counts = {"gold": 0, "silver": 0, "hard": 0}
+        tier_counts = {"gold": 0, "silver": 0, "copper": 0, "hard": 0}
         tier_map = {}
 
         for entry_dir in entry_dirs:
@@ -383,7 +391,8 @@ class RedundancyRemover:
             tier_counts[tier] += 1
 
         logger.info(f"数据分层: gold={tier_counts['gold']}, "
-                    f"silver={tier_counts['silver']}, hard={tier_counts['hard']}")
+                    f"silver={tier_counts['silver']}, copper={tier_counts['copper']}, "
+                    f"hard={tier_counts['hard']}")
 
         report = {
             "total_entries": len(entry_dirs),

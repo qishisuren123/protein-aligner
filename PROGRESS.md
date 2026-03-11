@@ -2,6 +2,55 @@
 
 ## 2026-03-11
 
+### V3.1 管线改进：物理精度提升 + 3D 可视化 + Domain 激活
+
+#### 改进内容
+
+1. **DensityCalculatorX → DensityCalculatorE** (`alignment_qc.py`, `enhancement.py`)
+   - 电子散射因子替代 X 射线散射因子，更适合 cryo-EM
+   - CC_mask 对比：7EFC 0.79→0.81, 8XPS 0.80→0.82
+
+2. **数据分层阈值更新** (`redundancy.py`, `configs/default.yaml`, `visualize_dataset.py`)
+   - 新增 Copper 层，从 3 层变 4 层
+   - Gold: res<2.5Å AND CC>0.80 AND Q>0.60
+   - Silver: res<4.0Å AND CC>0.70 AND Q>0.40
+   - Copper: CC>0.60 AND Q>0.20
+   - Hard: 其余
+
+3. **CC/Q-score 公式验证** — 无代码变动，确认实现正确
+
+4. **Merizo 安装并激活 Domain 标签** (`pipeline/domain.py`)
+   - 安装 PyTorch CPU + Merizo + 依赖
+   - 修复路径问题（绝对路径）、输出解析（.idx 文件优先）
+   - 4 条目全部有非零 domain：7A4M(2), 7EFC(2), 8XPS(3), 9K6S(2)
+
+5. **3D 等值面可视化** (`visualize_3d.py` 新建)
+   - marching cubes + plotly 交互式渲染
+   - 离散标签逐类别着色，连续标签 colorscale
+   - 输出带选项卡的 HTML（density/segment/atom/ss/chain/domain/interface/qscore/mol_map）
+   - 依赖：plotly, scikit-image, kaleido（PNG需Chrome）
+
+#### V3.1 测试结果
+
+| 条目 | CC_mask | Q_mean | Domains | Tier |
+|------|---------|--------|---------|------|
+| 7A4M (1.22Å) | 0.7592 | 0.564 | 2 | Silver |
+| 7EFC (1.70Å) | 0.8051 | 0.865 | 2 | Gold |
+| 8XPS (3.22Å) | 0.8162 | 0.653 | 3 | Silver |
+| 9K6S (2.80Å) | 0.3263 | 0.456 | 2 | Hard |
+
+#### 修改文件清单
+- `pipeline/alignment_qc.py` — DCX→DCE
+- `pipeline/enhancement.py` — DCX→DCE
+- `pipeline/domain.py` — 修复路径 + .idx 解析 + 适配 Merizo 实际接口
+- `pipeline/redundancy.py` — 4 层 tier (Gold/Silver/Copper/Hard)
+- `configs/default.yaml` — DCE + 4 层 tier 阈值
+- `visualize_dataset.py` — Copper tier 颜色
+- `visualize_3d.py` — 新建，3D 等值面可视化
+- `test_pipeline.py` — DCE 日志文字更新
+
+---
+
 ### V3 管线重构：Model Building 多层级标注数据集
 
 #### 核心设计变化

@@ -1,5 +1,6 @@
 # Cryo-EM 数据处理管线默认配置 (V3)
 # V3 核心变化：CA-only 标注、三组 KDTree、Domain/Interface/Q-score 新标签
+# V3.1: DCE 电子散射因子、4 层 tier（Gold/Silver/Copper/Hard）
 
 # 数据检索配置
 retrieval:
@@ -35,8 +36,8 @@ normalization:
 
 # 对齐与质量控制配置
 alignment_qc:
-  # DensityCalculatorX 参数
-  density_calculator: "gemmi_dcx"   # 使用 gemmi DensityCalculatorX
+  # DensityCalculatorE 参数（V3.1: 电子散射因子，更适合 cryo-EM）
+  density_calculator: "gemmi_dce"   # 使用 gemmi DensityCalculatorE
   default_resolution: 2.0           # 无 metadata 时使用的默认分辨率 (Å)
   dc_blur: 0                        # DensityCalculatorX blur 参数（0 = 最优）
   # CC 计算参数
@@ -114,15 +115,19 @@ redundancy:
   use_mmseqs2: true         # 启用 MMseqs2 精确聚类（不可用时自动回退 3-mer Jaccard）
   mmseqs2_identity: 0.3     # MMseqs2 聚类序列一致性阈值
   mmseqs2_binary: "tools/mmseqs"  # MMseqs2 二进制路径
-  # 数据质量分层
+  # 数据质量分层（V3.1: 4 层）
   tiers:
     gold:
       max_resolution: 2.5   # Å
-      min_cc_mask: 0.7
-      min_qscore: 0.5
+      min_cc_mask: 0.80
+      min_qscore: 0.60
     silver:
-      max_resolution: 3.5
-      min_cc_mask: 0.5
+      max_resolution: 4.0
+      min_cc_mask: 0.70
+      min_qscore: 0.40
+    copper:
+      min_cc_mask: 0.60
+      min_qscore: 0.20
   # V3 Pfam Fold/Family Split（防止结构同源泄露）
   pfam:
     enabled: true                    # 启用 Pfam 分组

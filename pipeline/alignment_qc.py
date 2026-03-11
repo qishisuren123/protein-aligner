@@ -3,7 +3,7 @@
 
 功能：
 - 验证原子模型与密度图的坐标系对齐
-- 使用 gemmi.DensityCalculatorX 生成物理级模拟密度图（原子散射因子）
+- 使用 gemmi.DensityCalculatorE 生成物理级模拟密度图（电子散射因子）
 - 支持生物学组装体展开（对称蛋白完整覆盖密度）
 - 计算 CC_mask、CC_volume、CC_overall 三项指标
 - 根据质量阈值过滤低质量数据
@@ -124,10 +124,10 @@ class AlignmentQC:
 
     def generate_simulated_map(self, grid, structure, resolution=None):
         """
-        使用 gemmi.DensityCalculatorX 生成物理级模拟密度图
+        使用 gemmi.DensityCalculatorE 生成物理级模拟密度图
 
-        DensityCalculatorX 使用 5 高斯近似的原子散射因子，
-        物理上更准确，CC 显著高于手写三线性+高斯模糊
+        DensityCalculatorE 使用电子散射因子（5 高斯近似），
+        比 DensityCalculatorX（X 射线散射因子）更适合 cryo-EM 密度图
         """
         if resolution is None:
             resolution = self.default_resolution
@@ -139,11 +139,11 @@ class AlignmentQC:
             1 for chain in model for res in chain
             if res.name != "HOH" for _ in res
         )
-        logger.info(f"  使用 DensityCalculatorX (blur={self.dc_blur}) 生成模拟密度图")
+        logger.info(f"  使用 DensityCalculatorE (blur={self.dc_blur}) 生成模拟密度图")
         logger.info(f"  原子数: {n_atoms}, 分辨率: {resolution:.2f}Å")
 
-        # 创建 DensityCalculatorX 并设置参数
-        dc = gemmi.DensityCalculatorX()
+        # 创建 DensityCalculatorE 并设置参数（电子散射因子，适合 cryo-EM）
+        dc = gemmi.DensityCalculatorE()
         dc.d_min = resolution
         dc.blur = self.dc_blur
         dc.grid.set_unit_cell(cell)
@@ -153,16 +153,16 @@ class AlignmentQC:
         # 放置原子（使用物理散射因子）
         dc.put_model_density_on_grid(model)
 
-        # 提取数据（DensityCalculatorX 可能自动调整 grid 尺寸）
+        # 提取数据（DensityCalculatorE 可能自动调整 grid 尺寸）
         sim_data = np.array(dc.grid, copy=True)
 
-        # 清除 NaN（DCX 偶尔产生极少量 NaN，会在 zoom 插值时传播）
+        # 清除 NaN（DCE 偶尔产生极少量 NaN，会在 zoom 插值时传播）
         nan_count = np.isnan(sim_data).sum()
         if nan_count > 0:
             logger.info(f"  清除 {nan_count} 个 NaN 值")
             sim_data = np.nan_to_num(sim_data, nan=0.0)
 
-        # 如果 DC 自动调整了 grid 尺寸，需要重采样到目标尺寸
+        # 如果 DCE 自动调整了 grid 尺寸，需要重采样到目标尺寸
         target_shape = (grid.nu, grid.nv, grid.nw)
         if sim_data.shape != target_shape:
             logger.info(f"  DC grid {sim_data.shape} -> 重采样到 {target_shape}")

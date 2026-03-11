@@ -83,16 +83,18 @@ def collect_data(raw_dir):
 
 
 def classify_tier(entry):
-    """根据质量指标分层"""
+    """根据质量指标分层（V3.1: 4 层）"""
     res = entry.get("resolution", 99)
     cc = entry.get("cc_mask", 0)
     qs = entry.get("q_score_mean", 0)
 
     if res is not None and cc is not None:
-        if res < 2.5 and cc > 0.7 and (qs or 0) > 0.5:
+        if res < 2.5 and cc > 0.80 and (qs or 0) > 0.60:
             return "Gold"
-        elif res < 3.5 and cc > 0.5:
+        elif res < 4.0 and cc > 0.70 and (qs or 0) > 0.40:
             return "Silver"
+        elif cc > 0.60 and (qs or 0) > 0.20:
+            return "Copper"
     return "Hard"
 
 
@@ -117,7 +119,7 @@ def plot_dataset_overview(entries, output_path):
     gs = GridSpec(2, 3, figure=fig, hspace=0.35, wspace=0.35)
 
     # 颜色方案
-    tier_colors = {"Gold": "#FFD700", "Silver": "#C0C0C0", "Hard": "#CD7F32"}
+    tier_colors = {"Gold": "#FFD700", "Silver": "#C0C0C0", "Copper": "#B87333", "Hard": "#CD7F32"}
 
     # === 1. 分辨率分布直方图 ===
     ax1 = fig.add_subplot(gs[0, 0])

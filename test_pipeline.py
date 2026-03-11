@@ -119,7 +119,7 @@ def main():
 
     # ===== Step 4: Alignment & QC =====
     logger.info("\n" + "=" * 60)
-    logger.info("Step 4: Alignment & QC (DensityCalculatorX + Bio Assembly + Q-score)")
+    logger.info("Step 4: Alignment & QC (DensityCalculatorE + Bio Assembly + Q-score)")
     logger.info("=" * 60)
 
     aligner = AlignmentQC(config)
