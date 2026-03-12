@@ -72,10 +72,10 @@ def load_mrc(path):
     return data, grid
 
 
-def downsample_volume(data, max_size=128):
+def downsample_volume(data, max_size=64):
     """
-    下采样体数据到合理尺寸，避免 marching cubes 过慢
-    对离散标签使用最近邻，对连续数据使用线性
+    下采样体数据到合理尺寸，避免 marching cubes 过慢和 HTML 过大
+    对离散标签使用最近邻
     """
     shape = np.array(data.shape)
     if shape.max() <= max_size:
@@ -119,8 +119,17 @@ def mesh_from_continuous(data, level, sigma=0.5):
         return None
 
 
+def decimate_mesh(verts, faces, max_faces=50000):
+    """简单的 mesh 抽稀：均匀采样 faces"""
+    if len(faces) <= max_faces:
+        return verts, faces
+    step = max(1, len(faces) // max_faces)
+    return verts, faces[::step]
+
+
 def make_mesh3d(verts, faces, color, name, opacity=0.6):
     """创建 plotly Mesh3d trace"""
+    verts, faces = decimate_mesh(verts, faces)
     return go.Mesh3d(
         x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
         i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
@@ -134,6 +143,8 @@ def make_mesh3d(verts, faces, color, name, opacity=0.6):
 
 def make_mesh3d_continuous(verts, faces, values, name, colorscale='Viridis', opacity=0.7):
     """创建带 colorscale 的 plotly Mesh3d trace（连续数据）"""
+    verts, faces = decimate_mesh(verts, faces)
+    # values 对应顶点，抽稀后仍可直接使用（顶点不变，只减少了 faces）
     return go.Mesh3d(
         x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
         i=faces[:, 0], j=faces[:, 1], k=faces[:, 2],
@@ -312,16 +323,37 @@ def build_combined_html(figures, entry_name):
     """
     将多个 plotly figure 组合成一个带选项卡的 HTML 页面
 
-    使用懒渲染策略：只在标签页首次可见时调用 Plotly.newPlot，
-    避免在 display:none 的 div 上渲染导致 0 尺寸问题。
+    方案：每个 figure 使用 plotly 官方 to_html(full_html=False) 生成片段，
+    所有片段放在各自 div 中，通过 CSS/JS 切换标签页可见性。
+    Plotly.js 内嵌在 HTML 中，不依赖 CDN。
     """
+    import plotly.io as pio
+
+    tab_names = list(figures.keys())
+
+    # 头部：内嵌 plotly.js（使用第一个 figure 的 to_html 来获取）
+    # 先生成各 figure 的 HTML 片段（不包含 plotly.js）
+    fig_htmls = {}
+    for name, fig in figures.items():
+        # full_html=False 返回 <div>+<script> 片段
+        # include_plotlyjs=False 不重复嵌入 plotly.js
+        fig_htmls[name] = pio.to_html(
+            fig, full_html=False, include_plotlyjs=False,
+            config={'responsive': True}
+        )
+
+    # 获取 plotly.js 并转义 </script> 防止提前关闭标签
+    import plotly
+    plotly_js = plotly.offline.get_plotlyjs()
+    plotly_js = plotly_js.replace('</script>', r'<\/script>')
+
     html_parts = []
     html_parts.append(f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
     <title>{entry_name} - 3D Label Visualization</title>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <script type="text/javascript">{plotly_js}</script>
     <style>
         body {{ font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
         h1 {{ color: #333; text-align: center; }}
@@ -329,70 +361,60 @@ def build_combined_html(figures, entry_name):
         .tab-btn {{ padding: 8px 16px; border: 1px solid #ddd; background: #fff; cursor: pointer;
                     border-radius: 4px; font-size: 14px; }}
         .tab-btn.active {{ background: #4C72B0; color: white; border-color: #4C72B0; }}
-        .plot-container {{ display: none; width: 100%; height: 700px; background: white;
-                          border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
-        .plot-container.active {{ display: block; }}
+        .plot-section {{ }}
+        .plot-section.hidden {{ display: none; }}
         .info {{ text-align: center; color: #666; margin: 10px 0; font-size: 13px; }}
     </style>
 </head>
 <body>
     <h1>{entry_name} - 3D Label Visualization (V3.2)</h1>
-    <p class="info">Click tabs to switch between label channels. Use mouse to rotate/zoom/pan.</p>
+    <p class="info">Click tabs to switch views. Use mouse to rotate/zoom/pan.</p>
     <div class="tab-container">
 """)
 
-    tab_names = list(figures.keys())
+    # 标签按钮
     for i, name in enumerate(tab_names):
         active = ' active' if i == 0 else ''
-        html_parts.append(f'        <button class="tab-btn{active}" onclick="showTab(\'{name}\')">{name}</button>\n')
+        html_parts.append(
+            f'        <button class="tab-btn{active}" '
+            f'onclick="showTab(\'{name}\', this)">{name}</button>\n'
+        )
 
     html_parts.append('    </div>\n')
 
-    for i, (name, fig) in enumerate(figures.items()):
-        active = ' active' if i == 0 else ''
-        div_id = f'plot_{name}'
-        html_parts.append(f'    <div id="{div_id}" class="plot-container{active}"></div>\n')
+    # 每个 figure 一个 section（初始全部可见，确保 plotly 正确渲染）
+    for i, name in enumerate(tab_names):
+        html_parts.append(f'    <div id="sec_{name}" class="plot-section">\n')
+        html_parts.append(f'        {fig_htmls[name]}\n')
+        html_parts.append(f'    </div>\n')
 
-    # 懒渲染：存储 figure JSON，仅在标签页首次可见时渲染
-    html_parts.append("""
-    <script>
-        var figureData = {};
-        var rendered = {};
+    # 页面加载完成后隐藏非首个 section，并设置标签切换
+    first_tab = tab_names[0] if tab_names else ''
+    html_parts.append(f"""
+    <script type="text/javascript">
+        // 页面加载完成后隐藏非激活标签（此时 plotly 已正确渲染）
+        window.addEventListener('load', function() {{
+            document.querySelectorAll('.plot-section').forEach(function(el) {{
+                if (el.id !== 'sec_{first_tab}') {{
+                    el.classList.add('hidden');
+                }}
+            }});
+        }});
 
-        function showTab(name) {
-            document.querySelectorAll('.plot-container').forEach(function(el) { el.classList.remove('active'); });
-            document.querySelectorAll('.tab-btn').forEach(function(el) { el.classList.remove('active'); });
-            document.getElementById('plot_' + name).classList.add('active');
-            event.target.classList.add('active');
+        function showTab(name, btn) {{
+            document.querySelectorAll('.plot-section').forEach(function(el) {{
+                el.classList.add('hidden');
+            }});
+            document.querySelectorAll('.tab-btn').forEach(function(el) {{
+                el.classList.remove('active');
+            }});
+            document.getElementById('sec_' + name).classList.remove('hidden');
+            if (btn) btn.classList.add('active');
 
-            // 懒渲染：首次显示时创建 plotly 图
-            if (!rendered[name]) {
-                var data = figureData[name];
-                Plotly.newPlot('plot_' + name, data.data, data.layout, {responsive: true});
-                rendered[name] = true;
-            } else {
-                Plotly.Plots.resize(document.getElementById('plot_' + name));
-            }
-        }
-""")
-
-    # 嵌入每个 figure 的 JSON 数据（不立即渲染）
-    for name, fig in figures.items():
-        fig_json = fig.to_json()
-        html_parts.append(f"""
-        figureData['{name}'] = {fig_json};
-""")
-
-    # 立即渲染第一个标签页（它是可见的）
-    if tab_names:
-        first = tab_names[0]
-        html_parts.append(f"""
-        // 渲染首个可见标签页
-        Plotly.newPlot('plot_{first}', figureData['{first}'].data, figureData['{first}'].layout, {{responsive: true}});
-        rendered['{first}'] = true;
-""")
-
-    html_parts.append("""
+            // 触发 plotly resize 以适应容器
+            var plots = document.getElementById('sec_' + name).querySelectorAll('.plotly-graph-div');
+            plots.forEach(function(p) {{ Plotly.Plots.resize(p); }});
+        }}
     </script>
 </body>
 </html>""")

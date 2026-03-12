@@ -2,6 +2,49 @@
 
 ## 2026-03-12
 
+### V3.3 管线改进：ChimeraX 标准 Molmap + 3D HTML 修复 + Domain 可视化修复
+
+#### 改进内容
+
+1. **Molmap 算法重写为 ChimeraX 标准** (`pipeline/molmap.py`)
+   - 弃用 gemmi DensityCalculatorE（电子散射因子，输出粗糙）
+   - 改为 ChimeraX molmap 标准算法：
+     - 振幅 = 原子序数 Z（非散射因子）
+     - sigma = resolution / (pi * sqrt(2))
+     - 内部细网格：步长 = resolution / 3（保证高斯被充分采样）
+     - 三线性插值放置原子 → 3D 高斯模糊 → 重采样到参考网格
+   - sim_map 与 mol_map 保持完全一致 (max_diff=0)
+
+2. **3D HTML 可视化修复** (`visualize_3d.py`)
+   - 弃用手动构建 HTML + 内联 JSON 的方式
+   - 改用 plotly 官方 `pio.to_html(full_html=False)` API
+   - Plotly.js 内嵌（转义 `</script>`），不依赖 CDN
+   - 页面加载完成后再隐藏非首 tab（保证 plotly 渲染在可见 div 上）
+   - mesh 抽稀（每 trace 最多 50k 面），下采样 max_size=64
+
+3. **Domain 子图修复** (`visualize_labels.py`)
+   - vis_label_stats.png 的 domain 柱状图之前空白
+   - 修复：domain 多时（>30）只显示 top-30，x 轴 label 大于 20 个时隐藏
+
+#### V3.3 测试结果
+
+| 条目 | CC_mask | CC_volume | Q_mean | ASU Dom | Total Dom | Tier |
+|------|---------|-----------|--------|---------|-----------|------|
+| 7A4M (1.22Å) | 0.172 | 0.718 | 0.564 | 2 | 48 | Hard |
+| 7EFC (1.70Å) | 0.227 | 0.625 | 0.865 | 2 | 8 | Hard |
+| 8XPS (3.22Å) | 0.612 | 0.713 | 0.653 | 4 | 4 | Copper |
+| 9K6S (2.80Å) | 0.237 | 0.532 | 0.456 | 2 | 2 | Hard |
+
+注：CC_mask 较 V3.2 进一步下降是因为从散射因子改为简单高斯（ChimeraX 标准），
+CC_volume 更能反映实际 map-model 一致性（0.53-0.72 范围合理）。
+
+#### 修改文件清单
+- `pipeline/molmap.py` — 重写，ChimeraX 标准高斯 blob 算法
+- `visualize_3d.py` — 重写 HTML 生成，用 plotly 官方 API
+- `visualize_labels.py` — 修复 domain 子图显示
+
+---
+
 ### V3.2 管线改进：Domain 组装体展开 + Molmap 统一 + 3D 修复
 
 #### 改进内容

@@ -359,9 +359,25 @@ def plot_label_stats(entry_dir, label_segment, label_atom, label_aa, label_ss,
     dom_vals = label_domain[label_domain > 0]
     if len(dom_vals) > 0:
         unique_doms, dom_counts = np.unique(dom_vals, return_counts=True)
-        axes[1, 2].bar(range(len(unique_doms)), dom_counts,
-                        color='seagreen', tick_label=[str(int(d)) for d in unique_doms])
-        axes[1, 2].set_title(f'Domain Distribution ({len(unique_doms)} domains)')
+        n_doms = len(unique_doms)
+        if n_doms > 30:
+            # domain 太多时只显示前30个（按体素数排序）
+            top_idx = np.argsort(-dom_counts)[:30]
+            unique_doms = unique_doms[top_idx]
+            dom_counts = dom_counts[top_idx]
+            # 按 domain ID 重新排序
+            sort_idx = np.argsort(unique_doms)
+            unique_doms = unique_doms[sort_idx]
+            dom_counts = dom_counts[sort_idx]
+            title_suffix = f' (top 30 of {n_doms})'
+        else:
+            title_suffix = ''
+        axes[1, 2].bar(range(len(unique_doms)), dom_counts, color='seagreen')
+        # 只在 domain 较少时显示 tick label
+        if len(unique_doms) <= 20:
+            axes[1, 2].set_xticks(range(len(unique_doms)))
+            axes[1, 2].set_xticklabels([str(int(d)) for d in unique_doms], fontsize=7)
+        axes[1, 2].set_title(f'Domain Distribution ({n_doms} domains){title_suffix}')
         axes[1, 2].set_xlabel('Domain ID')
         axes[1, 2].set_ylabel('Voxel Count')
     else:
