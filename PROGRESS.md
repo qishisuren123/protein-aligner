@@ -1,5 +1,50 @@
 # Cryo-EM 数据处理管线 - 进展记录
 
+## 2026-03-12
+
+### V3.2 管线改进：Domain 组装体展开 + Molmap 统一 + 3D 修复
+
+#### 改进内容
+
+1. **Domain ID 组装体展开** (`pipeline/domain.py` 重写)
+   - ASU 中每条蛋白链分别运行 Merizo
+   - 展开到组装体后 domain ID 按 copy 递增
+   - 例：ASU 2 domains → 24 copies = 48 total domains (7A4M)
+   - 通过残基序号匹配展开链到原始链
+
+2. **sim_map 与 mol_map 统一** (`pipeline/molmap.py` 新建)
+   - 按 ChimeraX molmap 规范统一两者参数
+   - sigma = resolution / (pi * sqrt(2)) ≈ 0.225 * resolution
+   - B_iso = 4 * resolution^2
+   - 清零原子 B-factor，使用统一 blur
+   - 验证：4 条目 sim_map 与 mol_map 完全一致 (max_diff=0)
+
+3. **3D HTML 渲染修复** (`visualize_3d.py`)
+   - 修复 Plotly 在 display:none div 上渲染为 0 尺寸的问题
+   - 实现懒渲染：仅在标签页首次可见时调用 Plotly.newPlot()
+
+#### V3.2 测试结果
+
+| 条目 | CC_mask | Q_mean | ASU Domains | Total Domains | Tier |
+|------|---------|--------|-------------|---------------|------|
+| 7A4M (1.22Å) | 0.6836 | 0.564 | 2 | 48 (24 copies) | Copper |
+| 7EFC (1.70Å) | 0.5970 | 0.865 | 2 | 8 (4 copies) | Hard |
+| 8XPS (3.22Å) | 0.6805 | 0.653 | 4 (B:1+A:3) | 4 (1 copy) | Copper |
+| 9K6S (2.80Å) | 0.2821 | 0.456 | 2 | 2 (1 copy) | Hard |
+
+注：CC_mask 相比 V3.1 有下降是因为 molmap 规范引入了与分辨率相关的 Gaussian blur，
+这比之前的 blur=0 更物理正确但使模拟密度更平滑。
+
+#### 修改文件清单
+- `pipeline/molmap.py` — 新建，ChimeraX molmap 规范密度生成
+- `pipeline/domain.py` — 重写，多链 Merizo + 组装体展开 + ID 递增
+- `pipeline/alignment_qc.py` — 使用共享 molmap 函数
+- `pipeline/enhancement.py` — 使用共享 molmap 函数，移除旧 blur 逻辑
+- `visualize_3d.py` — 懒渲染修复
+- `test_pipeline.py` — 日志文字更新
+
+---
+
 ## 2026-03-11
 
 ### V3.1 管线改进：物理精度提升 + 3D 可视化 + Domain 激活

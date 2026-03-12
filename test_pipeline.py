@@ -119,7 +119,7 @@ def main():
 
     # ===== Step 4: Alignment & QC =====
     logger.info("\n" + "=" * 60)
-    logger.info("Step 4: Alignment & QC (DensityCalculatorE + Bio Assembly + Q-score)")
+    logger.info("Step 4: Alignment & QC (Molmap + Bio Assembly + Q-score)")
     logger.info("=" * 60)
 
     aligner = AlignmentQC(config)
@@ -232,7 +232,7 @@ def main():
 
     # ===== Step 7: Enhancement Labeling =====
     logger.info("\n" + "=" * 60)
-    logger.info("Step 7: Enhancement Labeling (自适应 blur)")
+    logger.info("Step 7: Enhancement Labeling (Molmap)")
     logger.info("=" * 60)
 
     enhancer = EnhancementLabeler(config)

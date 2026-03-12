@@ -3,16 +3,15 @@
 
 功能：
 - 从原子模型生成模拟密度图（低噪声），作为去噪训练标签
-- 使用 gemmi.DensityCalculatorE 替代手写三线性插值（电子散射因子）
+- 按 ChimeraX molmap 规范生成，与 alignment_qc sim_map 参数一致
 - 支持生物学组装体展开
-- 从 metadata 读取分辨率，用 b_factor 控制模糊程度
+- 参考: https://www.rbvi.ucsf.edu/chimerax/docs/user/commands/molmap.html
 """
 import os
 import json
 import logging
 import numpy as np
 import gemmi
-from scipy.ndimage import zoom
 
 from pipeline.bio_assembly import expand_to_assembly
 
@@ -25,9 +24,7 @@ class EnhancementLabeler:
     def __init__(self, config):
         self.config = config
         enh_cfg = config['enhancement']
-        self.b_factor = enh_cfg.get('sim_b_factor', 100.0)
         self.resolution = enh_cfg.get('sim_resolution', 2.0)
-        self.adaptive_blur = enh_cfg.get('adaptive_blur', False)
         # 生物组装体配置
         bio_cfg = config.get('bio_assembly', {})
         self.bio_assembly_enabled = bio_cfg.get('enabled', True)
@@ -47,9 +44,10 @@ class EnhancementLabeler:
 
     def generate_mol_map(self, entry_dir):
         """
-        使用 DensityCalculatorE 生成模拟密度图 mol_map.mrc
+        按 ChimeraX molmap 规范生成模拟密度图 mol_map.mrc
 
-        使用电子散射因子，通过 b_factor 控制平滑程度
+        使用与 alignment_qc sim_map 相同的 molmap 参数，保证输出一致。
+        参考: https://www.rbvi.ucsf.edu/chimerax/docs/user/commands/molmap.html
         """
         map_path = os.path.join(entry_dir, "map_normalized.mrc")
         model_path = os.path.join(entry_dir, "model.cif")
@@ -77,54 +75,12 @@ class EnhancementLabeler:
                 max_chains=self.max_chains
             )
 
-        model = st[0]
-        n_atoms = sum(
-            1 for chain in model for res in chain
-            if res.name != "HOH" for _ in res
-        )
-
         # 获取分辨率
         resolution = self._get_resolution(entry_dir)
 
-        # 使用 DensityCalculatorE 生成密度（电子散射因子，适合 cryo-EM）
-        # blur = b_factor 来控制模拟密度的平滑度
-        # 自适应模式：按分辨率缩放，高分辨率保留更多细节
-        if self.adaptive_blur:
-            blur = self.b_factor * (resolution / 2.0)
-            logger.info(f"  自适应 blur: base={self.b_factor}, "
-                        f"resolution={resolution:.2f}Å, blur={blur:.1f}")
-        else:
-            blur = self.b_factor
-
-        dc = gemmi.DensityCalculatorE()
-        dc.d_min = resolution
-        dc.blur = blur
-        dc.grid.set_unit_cell(cell)
-        dc.grid.set_size(nu, nv, nw)
-        dc.grid.spacegroup = ref_grid.spacegroup
-
-        dc.put_model_density_on_grid(model)
-        mol_data = np.array(dc.grid, copy=True)
-
-        # 清除 NaN（DCE 偶尔产生极少量 NaN，会在 zoom 插值时传播）
-        nan_count = np.isnan(mol_data).sum()
-        if nan_count > 0:
-            logger.info(f"  清除 {nan_count} 个 NaN 值")
-            mol_data = np.nan_to_num(mol_data, nan=0.0)
-
-        # DensityCalculatorE 可能自动调整 grid 尺寸，需要重采样
-        target_shape = (nu, nv, nw)
-        if mol_data.shape != target_shape:
-            logger.info(f"  DC grid {mol_data.shape} -> 重采样到 {target_shape}")
-            zoom_factors = tuple(t / s for t, s in zip(target_shape, mol_data.shape))
-            mol_data = zoom(mol_data, zoom_factors, order=3)
-
-        logger.info(f"  DensityCalculatorE: {n_atoms} 原子, "
-                    f"resolution={resolution:.2f}Å, blur={blur:.1f}")
-
-        # 归一化
-        if mol_data.max() > 0:
-            mol_data /= mol_data.max()
+        # 按 molmap 规范生成模拟密度
+        from pipeline.molmap import generate_molmap
+        mol_data = generate_molmap(ref_grid, st, resolution)
 
         # 保存
         output_path = os.path.join(entry_dir, "mol_map.mrc")
@@ -132,7 +88,7 @@ class EnhancementLabeler:
         new_grid.set_unit_cell(cell)
         new_grid.spacegroup = ref_grid.spacegroup
         arr = np.array(new_grid, copy=False)
-        arr[:] = mol_data.astype(np.float32)
+        arr[:] = mol_data
 
         new_ccp4 = gemmi.Ccp4Map()
         new_ccp4.grid = new_grid

@@ -3,7 +3,7 @@
 
 功能：
 - 验证原子模型与密度图的坐标系对齐
-- 使用 gemmi.DensityCalculatorE 生成物理级模拟密度图（电子散射因子）
+- 按 ChimeraX molmap 规范生成模拟密度图
 - 支持生物学组装体展开（对称蛋白完整覆盖密度）
 - 计算 CC_mask、CC_volume、CC_overall 三项指标
 - 根据质量阈值过滤低质量数据
@@ -14,7 +14,6 @@ import logging
 import numpy as np
 import gemmi
 from scipy.stats import pearsonr
-from scipy.ndimage import zoom
 
 from pipeline.bio_assembly import expand_to_assembly
 from pipeline.qscore import compute_qscore_per_atom, compute_qscore_summary
@@ -124,61 +123,26 @@ class AlignmentQC:
 
     def generate_simulated_map(self, grid, structure, resolution=None):
         """
-        使用 gemmi.DensityCalculatorE 生成物理级模拟密度图
+        按 ChimeraX molmap 规范生成模拟密度图
 
-        DensityCalculatorE 使用电子散射因子（5 高斯近似），
-        比 DensityCalculatorX（X 射线散射因子）更适合 cryo-EM 密度图
+        使用统一的 molmap 参数（sigma = resolution/(pi*sqrt(2))），
+        保证 sim_map 和 mol_map 输出一致。
+
+        参考: https://www.rbvi.ucsf.edu/chimerax/docs/user/commands/molmap.html
         """
         if resolution is None:
             resolution = self.default_resolution
 
-        cell = grid.unit_cell
-        model = structure[0]
-
-        n_atoms = sum(
-            1 for chain in model for res in chain
-            if res.name != "HOH" for _ in res
-        )
-        logger.info(f"  使用 DensityCalculatorE (blur={self.dc_blur}) 生成模拟密度图")
-        logger.info(f"  原子数: {n_atoms}, 分辨率: {resolution:.2f}Å")
-
-        # 创建 DensityCalculatorE 并设置参数（电子散射因子，适合 cryo-EM）
-        dc = gemmi.DensityCalculatorE()
-        dc.d_min = resolution
-        dc.blur = self.dc_blur
-        dc.grid.set_unit_cell(cell)
-        dc.grid.set_size(grid.nu, grid.nv, grid.nw)
-        dc.grid.spacegroup = grid.spacegroup
-
-        # 放置原子（使用物理散射因子）
-        dc.put_model_density_on_grid(model)
-
-        # 提取数据（DensityCalculatorE 可能自动调整 grid 尺寸）
-        sim_data = np.array(dc.grid, copy=True)
-
-        # 清除 NaN（DCE 偶尔产生极少量 NaN，会在 zoom 插值时传播）
-        nan_count = np.isnan(sim_data).sum()
-        if nan_count > 0:
-            logger.info(f"  清除 {nan_count} 个 NaN 值")
-            sim_data = np.nan_to_num(sim_data, nan=0.0)
-
-        # 如果 DCE 自动调整了 grid 尺寸，需要重采样到目标尺寸
-        target_shape = (grid.nu, grid.nv, grid.nw)
-        if sim_data.shape != target_shape:
-            logger.info(f"  DC grid {sim_data.shape} -> 重采样到 {target_shape}")
-            zoom_factors = tuple(t / s for t, s in zip(target_shape, sim_data.shape))
-            sim_data = zoom(sim_data, zoom_factors, order=3)
-
-        # 归一化到 [0, 1]
-        if sim_data.max() > 0:
-            sim_data /= sim_data.max()
+        from pipeline.molmap import generate_molmap
+        sim_data = generate_molmap(grid, structure, resolution)
 
         # 包装为 gemmi grid
+        cell = grid.unit_cell
         sim_grid = gemmi.FloatGrid(grid.nu, grid.nv, grid.nw)
         sim_grid.set_unit_cell(cell)
         sim_grid.spacegroup = grid.spacegroup
         arr = np.array(sim_grid, copy=False)
-        arr[:] = sim_data.astype(np.float32)
+        arr[:] = sim_data
 
         return sim_grid
 

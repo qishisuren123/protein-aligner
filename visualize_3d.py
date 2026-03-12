@@ -311,6 +311,9 @@ def create_combined_figure(entry_dir):
 def build_combined_html(figures, entry_name):
     """
     将多个 plotly figure 组合成一个带选项卡的 HTML 页面
+
+    使用懒渲染策略：只在标签页首次可见时调用 Plotly.newPlot，
+    避免在 display:none 的 div 上渲染导致 0 尺寸问题。
     """
     html_parts = []
     html_parts.append(f"""<!DOCTYPE html>
@@ -333,7 +336,7 @@ def build_combined_html(figures, entry_name):
     </style>
 </head>
 <body>
-    <h1>{entry_name} - 3D Label Visualization (V3.1)</h1>
+    <h1>{entry_name} - 3D Label Visualization (V3.2)</h1>
     <p class="info">Click tabs to switch between label channels. Use mouse to rotate/zoom/pan.</p>
     <div class="tab-container">
 """)
@@ -350,26 +353,43 @@ def build_combined_html(figures, entry_name):
         div_id = f'plot_{name}'
         html_parts.append(f'    <div id="{div_id}" class="plot-container{active}"></div>\n')
 
+    # 懒渲染：存储 figure JSON，仅在标签页首次可见时渲染
     html_parts.append("""
     <script>
+        var figureData = {};
+        var rendered = {};
+
         function showTab(name) {
-            document.querySelectorAll('.plot-container').forEach(el => el.classList.remove('active'));
-            document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.plot-container').forEach(function(el) { el.classList.remove('active'); });
+            document.querySelectorAll('.tab-btn').forEach(function(el) { el.classList.remove('active'); });
             document.getElementById('plot_' + name).classList.add('active');
             event.target.classList.add('active');
-            // 触发 plotly resize
-            Plotly.Plots.resize(document.getElementById('plot_' + name));
+
+            // 懒渲染：首次显示时创建 plotly 图
+            if (!rendered[name]) {
+                var data = figureData[name];
+                Plotly.newPlot('plot_' + name, data.data, data.layout, {responsive: true});
+                rendered[name] = true;
+            } else {
+                Plotly.Plots.resize(document.getElementById('plot_' + name));
+            }
         }
 """)
 
-    # 嵌入每个 figure 的 JSON 数据和渲染代码
+    # 嵌入每个 figure 的 JSON 数据（不立即渲染）
     for name, fig in figures.items():
         fig_json = fig.to_json()
         html_parts.append(f"""
-        (function() {{
-            var figData = {fig_json};
-            Plotly.newPlot('plot_{name}', figData.data, figData.layout, {{responsive: true}});
-        }})();
+        figureData['{name}'] = {fig_json};
+""")
+
+    # 立即渲染第一个标签页（它是可见的）
+    if tab_names:
+        first = tab_names[0]
+        html_parts.append(f"""
+        // 渲染首个可见标签页
+        Plotly.newPlot('plot_{first}', figureData['{first}'].data, figureData['{first}'].layout, {{responsive: true}});
+        rendered['{first}'] = true;
 """)
 
     html_parts.append("""
