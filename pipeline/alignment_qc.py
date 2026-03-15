@@ -5,20 +5,45 @@
 - 验证原子模型与密度图的坐标系对齐
 - 按 ChimeraX molmap 规范生成模拟密度图
 - 支持生物学组装体展开（对称蛋白完整覆盖密度）
-- 计算 CC_mask、CC_volume、CC_overall 三项指标
+- 计算 CC_box、CC_mask、CC_volume、CC_peaks 四项指标
+  （Afonine et al., Acta Cryst. D74, 531–544, 2018）
 - 根据质量阈值过滤低质量数据
+
+CC 指标定义 (Afonine 2018):
+- CC_box:    整个 box 内的 Pearson CC
+- CC_mask:   分子掩膜内的 Pearson CC（掩膜由原子模型定义）
+- CC_volume: 模拟密度最高 N 个体素的 Pearson CC（N = 掩膜内体素数）
+- CC_peaks:  模拟 + 实验密度各自最高 N 个体素的并集的 Pearson CC
 """
 import os
 import json
 import logging
 import numpy as np
 import gemmi
-from scipy.stats import pearsonr
+from scipy.spatial import cKDTree
 
 from pipeline.bio_assembly import expand_to_assembly
 from pipeline.qscore import compute_qscore_per_atom, compute_qscore_summary
 
 logger = logging.getLogger(__name__)
+
+
+def _pearson_cc(x, y):
+    """
+    计算 Pearson 相关系数（先减均值）
+
+    等价于 scipy.stats.pearsonr 但更轻量，避免额外的 p-value 计算。
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    if len(x) < 2:
+        return 0.0
+    xm = x - x.mean()
+    ym = y - y.mean()
+    denom = np.sqrt(np.sum(xm ** 2) * np.sum(ym ** 2))
+    if denom < 1e-15:
+        return 0.0
+    return float(np.sum(xm * ym) / denom)
 
 
 class AlignmentQC:
@@ -27,11 +52,12 @@ class AlignmentQC:
     def __init__(self, config):
         self.config = config
         qc_cfg = config['alignment_qc']
-        self.mask_threshold = qc_cfg.get('mask_threshold', 0.05)
         self.cc_threshold = qc_cfg.get('cc_threshold', 0.3)
-        self.density_calculator = qc_cfg.get('density_calculator', 'gemmi_dcx')
+        self.density_calculator = qc_cfg.get('density_calculator', 'gemmi_dce')
         self.default_resolution = qc_cfg.get('default_resolution', 2.0)
         self.dc_blur = qc_cfg.get('dc_blur', 0)
+        # 分子掩膜半径（Å），默认根据分辨率自动设定
+        self.mask_radius = qc_cfg.get('mask_radius', None)
         # 生物组装体配置
         bio_cfg = config.get('bio_assembly', {})
         self.bio_assembly_enabled = bio_cfg.get('enabled', True)
@@ -146,77 +172,140 @@ class AlignmentQC:
 
         return sim_grid
 
-    def compute_cc_mask(self, exp_grid, sim_grid, mask_threshold=None):
+    def _build_molecular_mask(self, grid, structure, resolution):
         """
-        计算 CC_mask（模拟密度 mask 区域内的 Pearson 相关系数）
+        构建分子掩膜（Jiang & Brünger, 1994）
+
+        以原子模型定义 mask：每个网格点到最近原子的距离 <= mask_radius
+        则属于分子内部。
+
+        mask_radius 默认 = max(3.0, resolution * 0.7) Å，
+        这是 phenix/CCP4 常用的 mask 生成标准。
+
+        参数:
+            grid: gemmi.FloatGrid 参考网格
+            structure: gemmi.Structure 原子模型（已展开组装体）
+            resolution: float 分辨率 (Å)
+        返回:
+            mask: np.ndarray(bool), shape=(nu, nv, nw)
         """
-        if mask_threshold is None:
-            mask_threshold = self.mask_threshold
+        # 确定 mask 半径
+        if self.mask_radius is not None:
+            mask_r = self.mask_radius
+        else:
+            mask_r = max(3.0, resolution * 0.7)
 
-        exp_data = np.array(exp_grid, copy=True)
-        sim_data = np.array(sim_grid, copy=True)
+        # 收集原子坐标
+        model = structure[0]
+        positions = []
+        for chain in model:
+            for res in chain:
+                if res.name == "HOH":
+                    continue
+                for atom in res:
+                    positions.append([atom.pos.x, atom.pos.y, atom.pos.z])
 
-        mask = sim_data > mask_threshold
-        if mask.sum() == 0:
-            return 0.0
+        if not positions:
+            nu, nv, nw = grid.nu, grid.nv, grid.nw
+            return np.zeros((nu, nv, nw), dtype=bool)
 
-        exp_masked = exp_data[mask]
-        sim_masked = sim_data[mask]
+        positions = np.array(positions)
+        atom_tree = cKDTree(positions)
 
-        if exp_masked.std() == 0 or sim_masked.std() == 0:
-            return 0.0
+        cell = grid.unit_cell
+        nu, nv, nw = grid.nu, grid.nv, grid.nw
 
-        cc, _ = pearsonr(exp_masked.flatten(), sim_masked.flatten())
-        return float(cc)
+        # 生成网格点的笛卡尔坐标
+        # 分数坐标 → 笛卡尔坐标
+        orth_mat = np.array(cell.orth.mat.tolist())
 
-    def compute_all_cc(self, exp_grid, sim_grid, mask_threshold=None):
+        # 分块处理避免内存溢出（对大网格）
+        chunk_size = 500000  # 每块 50 万点
+        total_points = nu * nv * nw
+        mask_flat = np.zeros(total_points, dtype=bool)
+
+        # 生成分数坐标索引
+        ii = np.arange(nu, dtype=np.float64) / nu
+        jj = np.arange(nv, dtype=np.float64) / nv
+        kk = np.arange(nw, dtype=np.float64) / nw
+
+        for i_start in range(0, nu, max(1, chunk_size // (nv * nw))):
+            i_end = min(i_start + max(1, chunk_size // (nv * nw)), nu)
+            fi = ii[i_start:i_end]
+            fi_grid, fj_grid, fk_grid = np.meshgrid(fi, jj, kk, indexing='ij')
+            frac = np.stack([fi_grid.ravel(), fj_grid.ravel(), fk_grid.ravel()], axis=1)
+            cart = frac @ orth_mat.T
+
+            # 查询最近原子距离
+            dists, _ = atom_tree.query(cart, k=1)
+
+            # 写入 mask
+            start_idx = i_start * nv * nw
+            end_idx = start_idx + len(dists)
+            mask_flat[start_idx:end_idx] = (dists <= mask_r)
+
+        mask = mask_flat.reshape(nu, nv, nw)
+        n_masked = mask.sum()
+        logger.info(f"  分子掩膜: radius={mask_r:.1f}Å, "
+                    f"掩膜内体素={n_masked} ({100*n_masked/total_points:.1f}%)")
+
+        return mask
+
+    def compute_all_cc(self, exp_grid, sim_grid, molecular_mask):
         """
-        计算三项 CC 指标：CC_mask, CC_volume, CC_overall
+        计算四项 CC 指标 (Afonine et al., Acta Cryst. D74, 2018)
 
-        - CC_mask: 模拟密度 mask 区域的 Pearson CC
-        - CC_volume: 实验密度 mask 区域的 Pearson CC
-        - CC_overall: 全体素 Pearson CC
+        所有 CC 均为 Pearson 相关系数（先减均值再计算）。
+
+        - CC_box:    整个 box 内所有体素
+        - CC_mask:   分子掩膜内的体素（由原子模型定义）
+        - CC_volume: 模拟密度最高 N 个体素（N = 掩膜内体素数）
+        - CC_peaks:  模拟 + 实验各自最高 N 个体素的并集
+
+        参数:
+            exp_grid: gemmi.FloatGrid 实验密度
+            sim_grid: gemmi.FloatGrid 模拟密度
+            molecular_mask: np.ndarray(bool) 分子掩膜
+        返回:
+            dict: cc_box, cc_mask, cc_volume, cc_peaks
         """
-        if mask_threshold is None:
-            mask_threshold = self.mask_threshold
-
-        exp_data = np.array(exp_grid, copy=True)
-        sim_data = np.array(sim_grid, copy=True)
+        exp_data = np.array(exp_grid, copy=True).astype(np.float64)
+        sim_data = np.array(sim_grid, copy=True).astype(np.float64)
 
         results = {}
+        N = int(molecular_mask.sum())  # 掩膜内体素数
 
-        # CC_mask: 模拟密度 mask 内
-        sim_mask = sim_data > mask_threshold
-        if sim_mask.sum() > 0:
-            e, s = exp_data[sim_mask], sim_data[sim_mask]
-            if e.std() > 0 and s.std() > 0:
-                results["cc_mask"] = float(pearsonr(e, s)[0])
-            else:
-                results["cc_mask"] = 0.0
+        # CC_box: 整个 box
+        results["cc_box"] = _pearson_cc(exp_data.ravel(), sim_data.ravel())
+
+        # CC_mask: 分子掩膜内
+        if N > 0:
+            results["cc_mask"] = _pearson_cc(exp_data[molecular_mask],
+                                              sim_data[molecular_mask])
         else:
             results["cc_mask"] = 0.0
 
-        # CC_volume: 实验密度 mask 内
-        exp_mask = exp_data > mask_threshold
-        if exp_mask.sum() > 0:
-            e, s = exp_data[exp_mask], sim_data[exp_mask]
-            if e.std() > 0 and s.std() > 0:
-                results["cc_volume"] = float(pearsonr(e, s)[0])
-            else:
-                results["cc_volume"] = 0.0
+        # CC_volume: 模拟密度最高 N 个体素
+        if N > 0:
+            sim_flat = sim_data.ravel()
+            # argpartition 比 argsort 更快（O(n) vs O(n log n)）
+            top_n_indices = np.argpartition(sim_flat, -N)[-N:]
+            results["cc_volume"] = _pearson_cc(exp_data.ravel()[top_n_indices],
+                                                sim_flat[top_n_indices])
         else:
             results["cc_volume"] = 0.0
 
-        # CC_overall: 全体素（有信号区域）
-        combined_mask = sim_mask | exp_mask
-        if combined_mask.sum() > 0:
-            e, s = exp_data[combined_mask], sim_data[combined_mask]
-            if e.std() > 0 and s.std() > 0:
-                results["cc_overall"] = float(pearsonr(e, s)[0])
-            else:
-                results["cc_overall"] = 0.0
+        # CC_peaks: 模拟 + 实验各自最高 N 个体素的并集
+        if N > 0:
+            sim_flat = sim_data.ravel()
+            exp_flat = exp_data.ravel()
+            top_sim = set(np.argpartition(sim_flat, -N)[-N:].tolist())
+            top_exp = set(np.argpartition(exp_flat, -N)[-N:].tolist())
+            peaks_indices = np.array(sorted(top_sim | top_exp))
+            results["cc_peaks"] = _pearson_cc(exp_flat[peaks_indices],
+                                               sim_flat[peaks_indices])
         else:
-            results["cc_overall"] = 0.0
+            results["cc_peaks"] = 0.0
 
         return results
 
@@ -262,14 +351,18 @@ class AlignmentQC:
         # 获取分辨率
         resolution = self._get_resolution(entry_dir)
 
-        # 生成模拟密度图（DensityCalculatorX）
+        # 生成模拟密度图
         sim_grid = self.generate_simulated_map(grid, structure, resolution)
 
-        # 计算全部 CC 指标
-        cc_results = self.compute_all_cc(grid, sim_grid)
-        logger.info(f"  CC_mask={cc_results['cc_mask']:.4f}, "
+        # 构建分子掩膜（Afonine 2018 标准）
+        molecular_mask = self._build_molecular_mask(grid, structure, resolution)
+
+        # 计算全部 CC 指标（Afonine 2018）
+        cc_results = self.compute_all_cc(grid, sim_grid, molecular_mask)
+        logger.info(f"  CC_box={cc_results['cc_box']:.4f}, "
+                    f"CC_mask={cc_results['cc_mask']:.4f}, "
                     f"CC_volume={cc_results['cc_volume']:.4f}, "
-                    f"CC_overall={cc_results['cc_overall']:.4f}")
+                    f"CC_peaks={cc_results['cc_peaks']:.4f}")
 
         # 综合判断：CC_mask 或 CC_volume 有一项达标即通过
         cc_mask = cc_results['cc_mask']
@@ -281,9 +374,10 @@ class AlignmentQC:
         logger.info(f"  质量判定: {quality}")
 
         metrics = {
+            "cc_box": cc_results['cc_box'],
             "cc_mask": cc_mask,
             "cc_volume": cc_results['cc_volume'],
-            "cc_overall": cc_results['cc_overall'],
+            "cc_peaks": cc_results['cc_peaks'],
             "quality_score": float(quality_score),
             "resolution": resolution,
             "n_atoms_orig": n_orig_atoms,
@@ -294,6 +388,7 @@ class AlignmentQC:
             "dc_blur": self.dc_blur,
             "grid_shape": [grid.nu, grid.nv, grid.nw],
             "spacing": [float(s) for s in grid.spacing],
+            "mask_voxels": int(molecular_mask.sum()),
             "passed": bool(passed),
             "quality": quality,
             "diagnostics": diag_info,
@@ -306,15 +401,16 @@ class AlignmentQC:
         sim_ccp4.update_ccp4_header()
         sim_ccp4.write_ccp4_map(sim_path)
 
-        # 计算 Q-score（原子级密度拟合置信度）
+        # 计算 Q-score（原子级密度拟合置信度，Pintilie 2020）
         try:
             qscore_cfg = self.config.get('qscore', {})
             qscores, _ = compute_qscore_per_atom(
                 grid, structure,
                 sigma=qscore_cfg.get('sigma', 0.6),
-                n_directions=qscore_cfg.get('n_directions', 40),
+                n_directions=qscore_cfg.get('n_directions', 64),
                 max_radius=qscore_cfg.get('max_radius', 2.0),
                 step_size=qscore_cfg.get('step_size', 0.1),
+                n_points_per_shell=qscore_cfg.get('n_points_per_shell', 8),
             )
             qscore_summary = compute_qscore_summary(qscores)
             metrics.update(qscore_summary)

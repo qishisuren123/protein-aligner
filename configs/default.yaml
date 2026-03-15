@@ -34,23 +34,22 @@ normalization:
   clip_min: 0.0
   clip_max: 1.0
 
-# 对齐与质量控制配置
+# 对齐与质量控制配置 (V3.4: Afonine 2018 CC metrics)
 alignment_qc:
-  # DensityCalculatorE 参数（V3.1: 电子散射因子，更适合 cryo-EM）
-  density_calculator: "gemmi_dce"   # 使用 gemmi DensityCalculatorE
-  default_resolution: 2.0           # 无 metadata 时使用的默认分辨率 (Å)
-  dc_blur: 0                        # DensityCalculatorX blur 参数（0 = 最优）
-  # CC 计算参数
-  mask_threshold: 0.05    # CC 计算时的 mask 阈值
-  # 质量阈值
+  density_calculator: "chimerax_molmap"  # ChimeraX molmap 规范
+  default_resolution: 2.0               # 无 metadata 时使用的默认分辨率 (Å)
+  dc_blur: 0
+  # CC 计算参数 (Afonine et al., Acta Cryst. D74, 531–544, 2018)
+  # mask_radius: null     # 分子掩膜半径 (Å)，null = 自动: max(3.0, resolution*0.7)
   cc_threshold: 0.3       # CC_mask 最低通过阈值
 
-# Q-score 配置 (Pintilie et al., 2020)
+# Q-score 配置 (Pintilie et al., Nature Methods 17, 328–334, 2020)
 qscore:
   sigma: 0.6              # 参考高斯宽度 (Å)
-  n_directions: 40        # Fibonacci sphere 采样方向数
+  n_directions: 64        # Fibonacci sphere 候选方向数（过滤后取 N=8）
   max_radius: 2.0         # 最大采样半径 (Å)
   step_size: 0.1          # 径向距离步长 (Å)
+  n_points_per_shell: 8   # 每个半径壳层保留的有效采样点数
 
 # V3 结构域分割配置（Merizo 深度学习工具）
 domain_segmentation:

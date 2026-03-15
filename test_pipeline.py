@@ -135,7 +135,10 @@ def main():
         n_chains = r['metrics']['n_chains']
         q_mean = r['metrics'].get('q_score_mean', 'N/A')
         q_median = r['metrics'].get('q_score_median', 'N/A')
-        logger.info(f"  {entry_name}: CC_mask={cc_mask:.4f}, CC_volume={cc_volume:.4f}, "
+        cc_box = r['metrics'].get('cc_box', 'N/A')
+        cc_peaks = r['metrics'].get('cc_peaks', 'N/A')
+        logger.info(f"  {entry_name}: CC_box={cc_box}, CC_mask={cc_mask:.4f}, "
+                    f"CC_volume={cc_volume:.4f}, CC_peaks={cc_peaks}, "
                     f"atoms={n_atoms}, chains={n_chains}, "
                     f"Q-score mean={q_mean}, median={q_median}")
 
@@ -301,9 +304,10 @@ def main():
             with open(qc_path) as f:
                 qc = json.load(f)
             logger.info(f"\n{dirname} QC:")
+            logger.info(f"  CC_box:       {qc.get('cc_box', 'N/A')}")
             logger.info(f"  CC_mask:      {qc.get('cc_mask', 'N/A')}")
             logger.info(f"  CC_volume:    {qc.get('cc_volume', 'N/A')}")
-            logger.info(f"  CC_overall:   {qc.get('cc_overall', 'N/A')}")
+            logger.info(f"  CC_peaks:     {qc.get('cc_peaks', 'N/A')}")
             logger.info(f"  Q-score mean: {qc.get('q_score_mean', 'N/A')}")
             logger.info(f"  Q-score med:  {qc.get('q_score_median', 'N/A')}")
             logger.info(f"  原子数:       {qc.get('n_atoms_orig', '?')} -> {qc.get('n_atoms_expanded', '?')}")

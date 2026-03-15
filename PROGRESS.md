@@ -1,5 +1,56 @@
 # Cryo-EM 数据处理管线 - 进展记录
 
+## 2026-03-15
+
+### V3.4 管线改进：CC 指标标准化 (Afonine 2018) + Q-score 修正 (Pintilie 2020)
+
+#### 改进内容
+
+1. **CC 指标重写为 Afonine et al. 2018 标准** (`pipeline/alignment_qc.py`)
+   - 弃用密度阈值 mask（`sim_data > 0.05`），改为分子掩膜（原子模型定义）
+   - 分子掩膜：cKDTree 查询每个网格点到最近原子的距离 ≤ mask_radius
+   - mask_radius = max(3.0, resolution × 0.7) Å
+   - 实现四项标准 CC 指标：
+     - **CC_box**: 整个 box 内的 Pearson CC
+     - **CC_mask**: 分子掩膜内的 Pearson CC（Jiang & Brünger 1994）
+     - **CC_volume**: 模拟密度最高 N 个体素的 CC（N = 掩膜内体素数）
+     - **CC_peaks**: 模拟 + 实验各自最高 N 个体素的并集的 CC
+   - 移除不存在的 CC_overall 指标
+   - 自定义 `_pearson_cc()` 函数（先减均值，无 p-value 开销）
+
+2. **Q-score 重写为 Pintilie et al. 2020 标准** (`pipeline/qscore.py`)
+   - 核心改进：每个半径 r 只使用"离当前原子最近"的球面采样点
+     - 构建全原子 cKDTree，对每个采样点查询最近原子
+     - 只保留最近原子 = 当前原子的点（排除邻近原子密度污染）
+   - 每个半径壳层保留 N=8 个有效点
+   - r=0 使用原子中心密度值（所有方向汇聚于一点）
+   - 残基聚合从 median 改为 mean
+   - 候选方向数从 40 增加到 64（确保过滤后仍有足够有效点）
+
+#### V3.4 测试结果
+
+| 条目 | CC_box | CC_mask | CC_vol | CC_peaks | Q_mean | Tier |
+|------|--------|---------|--------|----------|--------|------|
+| 7A4M (1.22Å) | 0.648 | 0.707 | 0.710 | 0.652 | 0.710 | Silver |
+| 7EFC (1.70Å) | 0.678 | 0.632 | 0.643 | 0.638 | 0.886 | Copper |
+| 8XPS (3.22Å) | 0.850 | 0.747 | 0.746 | 0.743 | 0.755 | Silver |
+| 9K6S (2.80Å) | 0.429 | 0.351 | 0.353 | 0.265 | 0.472 | Hard |
+
+对比 V3.3：
+- CC_mask 大幅提升（V3.3 使用密度阈值导致 mask 过大，CC 被稀释）
+- Q_mean 提升（closest-atom 过滤排除了邻近原子干扰）
+- 7A4M: CC_mask 0.172→0.707, Q 0.564→0.710
+- 7EFC: CC_mask 0.227→0.632, Q 0.865→0.886
+- 8XPS: CC_mask 0.612→0.747, Q 0.653→0.755
+
+#### 修改文件清单
+- `pipeline/alignment_qc.py` — 重写 CC 计算，分子掩膜 + 四项 CC + 移除 CC_overall
+- `pipeline/qscore.py` — 重写，closest-atom 过滤 + N=8/shell + mean 聚合
+- `configs/default.yaml` — 更新 QC + Q-score 配置
+- `test_pipeline.py` — 更新 CC 日志（cc_box/cc_peaks 替换 cc_overall）
+
+---
+
 ## 2026-03-12
 
 ### V3.3 管线改进：ChimeraX 标准 Molmap + 3D HTML 修复 + Domain 可视化修复
