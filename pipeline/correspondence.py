@@ -18,7 +18,6 @@ import json
 import logging
 import numpy as np
 import gemmi
-from scipy.spatial import cKDTree
 
 from pipeline.bio_assembly import expand_to_assembly
 from pipeline.interface import detect_interface
@@ -49,8 +48,6 @@ class CorrespondenceLabeler:
     def __init__(self, config):
         self.config = config
         corr_cfg = config['correspondence']
-        self.distance_threshold = corr_cfg['distance_threshold']
-        self.use_voronoi = corr_cfg.get('use_voronoi', False)  # V3 默认关闭
         # 界面检测配置
         iface_cfg = corr_cfg.get('interface', {})
         self.interface_threshold = iface_cfg.get('distance_threshold', 5.0)
@@ -253,9 +250,48 @@ class CorrespondenceLabeler:
         ccp4.update_ccp4_header()
         ccp4.write_ccp4_map(output_path)
 
+    def _atom_to_voxel(self, atoms_list, cell, nu, nv, nw):
+        """
+        将原子坐标转换为最近的 voxel index
+
+        每个原子只对应一个体素（四舍五入取最近网格点）。
+
+        参数:
+            atoms_list: 原子字典列表
+            cell: gemmi.UnitCell
+            nu, nv, nw: 网格维度
+        返回:
+            voxel_idx: (N, 3) int 数组，每行是 (i, j, k) 网格索引
+        """
+        n = len(atoms_list)
+        if n == 0:
+            return np.zeros((0, 3), dtype=int)
+
+        grid_idx = np.zeros((n, 3), dtype=np.float64)
+        for i, a in enumerate(atoms_list):
+            pos = gemmi.Position(*a['coord'])
+            frac = cell.fractionalize(pos)
+            grid_idx[i] = [frac.x * nu, frac.y * nv, frac.z * nw]
+
+        # 四舍五入到最近网格点，裁剪到有效范围
+        voxel_idx = np.round(grid_idx).astype(int)
+        voxel_idx[:, 0] = np.clip(voxel_idx[:, 0], 0, nu - 1)
+        voxel_idx[:, 1] = np.clip(voxel_idx[:, 1], 0, nv - 1)
+        voxel_idx[:, 2] = np.clip(voxel_idx[:, 2], 0, nw - 1)
+
+        return voxel_idx
+
     def label_voxels(self, entry_dir):
         """
-        V3 体素标注 — 三 KDTree + CA-only 范式
+        V3 体素标注 — 点标注范式
+
+        每个原子直接映射到其所在的 voxel，只标注该单个体素。
+        不再搜索"有信号体素"做最近邻匹配。
+
+        三组原子分别标注：
+        - all_atoms → label_segment (0/1), label_atom (原子类型)
+        - ca_atoms → label_aa, label_ss, label_chain, label_domain, label_interface
+        - backbone_atoms → label_qscore
 
         输出 8 个标签通道:
         1. label_segment.mrc: 蛋白/背景 (0/1)
@@ -301,24 +337,10 @@ class CorrespondenceLabeler:
         # 界面检测（在真实 Å 坐标空间进行）
         interface_labels = detect_interface(ca_atoms, threshold=self.interface_threshold)
 
-        # === 坐标转换：真实 Å → grid 索引 ===
-        def coords_to_grid(atoms_list):
-            coords_real = np.array([a['coord'] for a in atoms_list])
-            grid_idx = np.zeros_like(coords_real)
-            for i in range(len(atoms_list)):
-                pos = gemmi.Position(*coords_real[i])
-                frac = cell.fractionalize(pos)
-                grid_idx[i] = [frac.x * nu, frac.y * nv, frac.z * nw]
-            return grid_idx
-
-        all_grid_idx = coords_to_grid(all_atoms)
-        ca_grid_idx = coords_to_grid(ca_atoms) if ca_atoms else np.zeros((0, 3))
-        bb_grid_idx = coords_to_grid(backbone_atoms) if backbone_atoms else np.zeros((0, 3))
-
-        # === 建 KDTree ===
-        tree_all = cKDTree(all_grid_idx)
-        tree_ca = cKDTree(ca_grid_idx) if len(ca_atoms) > 0 else None
-        tree_backbone = cKDTree(bb_grid_idx) if len(backbone_atoms) > 0 else None
+        # === 原子坐标 → voxel index（每个原子一个体素）===
+        vox_all = self._atom_to_voxel(all_atoms, cell, nu, nv, nw)
+        vox_ca = self._atom_to_voxel(ca_atoms, cell, nu, nv, nw)
+        vox_bb = self._atom_to_voxel(backbone_atoms, cell, nu, nv, nw)
 
         # === 初始化 8 个标签通道 ===
         label_segment = np.zeros((nu, nv, nw), dtype=np.int16)
@@ -330,11 +352,18 @@ class CorrespondenceLabeler:
         label_domain = np.zeros((nu, nv, nw), dtype=np.int16)
         label_interface = np.zeros((nu, nv, nw), dtype=np.int16)
 
-        # === 预计算属性数组 ===
-        # tree_all 属性
+        # === 1. all_atoms → label_segment + label_atom ===
         atom_types_all = np.array([a['atom_type'] for a in all_atoms], dtype=np.int16)
+        vi, vj, vk = vox_all[:, 0], vox_all[:, 1], vox_all[:, 2]
+        label_segment[vi, vj, vk] = 1
+        label_atom[vi, vj, vk] = atom_types_all
 
-        # tree_ca 属性
+        # 统计唯一体素数（多个原子可能映射到同一体素）
+        n_segment = int(label_segment.sum())
+        logger.info(f"  label_segment/atom: {n_segment} 体素 "
+                    f"(原子={len(all_atoms)}, 唯一体素={n_segment})")
+
+        # === 2. ca_atoms → label_aa + label_ss + label_chain + label_domain + label_interface ===
         if ca_atoms:
             aa_types_ca = np.array([a['aa_type'] for a in ca_atoms], dtype=np.int16)
             ss_types_ca = np.array([
@@ -344,106 +373,38 @@ class CorrespondenceLabeler:
             chain_nums_ca = np.array([
                 chain_to_num.get(a['chain'], 0) for a in ca_atoms
             ], dtype=np.int16)
-            # Domain ID：从 domain_assignment.json 读取
             domain_ids_ca = np.array([
                 domain_data.get(f"{a['chain']}_{a['residue_seq']}", 0)
                 for a in ca_atoms
             ], dtype=np.int16)
-            # Interface：已计算
             interface_ca = interface_labels
 
-        # tree_backbone 属性：Q-score
+            vi, vj, vk = vox_ca[:, 0], vox_ca[:, 1], vox_ca[:, 2]
+            label_aa[vi, vj, vk] = aa_types_ca
+            label_ss[vi, vj, vk] = ss_types_ca
+            label_chain[vi, vj, vk] = chain_nums_ca
+            label_domain[vi, vj, vk] = domain_ids_ca
+            label_interface[vi, vj, vk] = interface_ca
+
+            n_ca_labeled = int((label_aa > 0).sum())
+            logger.info(f"  CA-only 标签: {n_ca_labeled} 体素 "
+                        f"(CA 原子={len(ca_atoms)})")
+        else:
+            n_ca_labeled = 0
+
+        # === 3. backbone_atoms → label_qscore ===
         if backbone_atoms:
             qscore_values_bb = np.array([
                 qscore_data.get(f"{a['chain']}_{a['residue_seq']}_{a['atom_name']}", 0.0)
                 for a in backbone_atoms
             ], dtype=np.float32)
 
-        # === 查询信号体素 ===
-        threshold = 0.05
-        signal_mask = data > threshold
-        signal_coords = np.argwhere(signal_mask)
-        logger.info(f"  有信号体素: {len(signal_coords)}/{data.size} "
-                    f"({100 * len(signal_coords) / data.size:.1f}%)")
+            vi, vj, vk = vox_bb[:, 0], vox_bb[:, 1], vox_bb[:, 2]
+            label_qscore[vi, vj, vk] = qscore_values_bb
 
-        if len(signal_coords) == 0:
-            logger.warning("  无信号体素")
-            return None
-
-        # 距离阈值（grid 索引单位）
-        spacing_avg = (grid.spacing[0] + grid.spacing[1] + grid.spacing[2]) / 3.0
-        dist_thresh_grid = self.distance_threshold / spacing_avg
-
-        query_coords = signal_coords.astype(np.float64)
-
-        # === 1. tree_all → label_segment + label_atom ===
-        dist_all, idx_all = tree_all.query(query_coords, k=1)
-        within_all = dist_all <= dist_thresh_grid
-        within_idx_all = np.where(within_all)[0]
-
-        vi = signal_coords[within_idx_all, 0]
-        vj = signal_coords[within_idx_all, 1]
-        vk = signal_coords[within_idx_all, 2]
-        ai = idx_all[within_idx_all]
-
-        label_segment[vi, vj, vk] = 1
-        label_atom[vi, vj, vk] = atom_types_all[ai]
-
-        n_segment = len(within_idx_all)
-        logger.info(f"  label_segment/atom: {n_segment} 体素 "
-                    f"({100 * n_segment / data.size:.2f}%)")
-
-        # Voronoi 扩展（可选，V3 默认关闭）
-        if self.use_voronoi:
-            beyond_all = ~within_all
-            beyond_idx_all = np.where(beyond_all)[0]
-            if len(beyond_idx_all) > 0:
-                vi_v = signal_coords[beyond_idx_all, 0]
-                vj_v = signal_coords[beyond_idx_all, 1]
-                vk_v = signal_coords[beyond_idx_all, 2]
-                ai_v = idx_all[beyond_idx_all]
-                label_segment[vi_v, vj_v, vk_v] = 1
-                label_atom[vi_v, vj_v, vk_v] = atom_types_all[ai_v]
-                logger.info(f"  Voronoi 扩展: +{len(beyond_idx_all)} 体素")
-
-        # === 2. tree_ca → label_aa + label_ss + label_chain + label_domain + label_interface ===
-        if tree_ca is not None:
-            dist_ca, idx_ca = tree_ca.query(query_coords, k=1)
-            within_ca = dist_ca <= dist_thresh_grid
-            within_idx_ca = np.where(within_ca)[0]
-
-            vi = signal_coords[within_idx_ca, 0]
-            vj = signal_coords[within_idx_ca, 1]
-            vk = signal_coords[within_idx_ca, 2]
-            ci = idx_ca[within_idx_ca]
-
-            label_aa[vi, vj, vk] = aa_types_ca[ci]
-            label_ss[vi, vj, vk] = ss_types_ca[ci]
-            label_chain[vi, vj, vk] = chain_nums_ca[ci]
-            label_domain[vi, vj, vk] = domain_ids_ca[ci]
-            label_interface[vi, vj, vk] = interface_ca[ci]
-
-            n_ca_labeled = len(within_idx_ca)
-            logger.info(f"  CA-only 标签 (aa/ss/chain/domain/interface): "
-                        f"{n_ca_labeled} 体素")
-        else:
-            n_ca_labeled = 0
-
-        # === 3. tree_backbone → label_qscore ===
-        if tree_backbone is not None:
-            dist_bb, idx_bb = tree_backbone.query(query_coords, k=1)
-            within_bb = dist_bb <= dist_thresh_grid
-            within_idx_bb = np.where(within_bb)[0]
-
-            vi = signal_coords[within_idx_bb, 0]
-            vj = signal_coords[within_idx_bb, 1]
-            vk = signal_coords[within_idx_bb, 2]
-            bi = idx_bb[within_idx_bb]
-
-            label_qscore[vi, vj, vk] = qscore_values_bb[bi]
-
-            n_qscore = len(within_idx_bb)
-            logger.info(f"  label_qscore (backbone): {n_qscore} 体素")
+            n_qscore = int((label_qscore != 0).sum())
+            logger.info(f"  label_qscore: {n_qscore} 体素 "
+                        f"(骨架原子={len(backbone_atoms)})")
         else:
             n_qscore = 0
 
@@ -473,10 +434,9 @@ class CorrespondenceLabeler:
             "n_atoms_ca": len(ca_atoms),
             "n_atoms_backbone": len(backbone_atoms),
             "n_chains": len(chain_ids),
-            "n_voxels_segment": int(n_segment),
-            "n_voxels_ca_labeled": int(n_ca_labeled),
-            "n_voxels_qscore": int(n_qscore),
-            "n_voxels_signal": int(len(signal_coords)),
+            "n_voxels_segment": n_segment,
+            "n_voxels_ca_labeled": n_ca_labeled,
+            "n_voxels_qscore": n_qscore,
             "n_voxels_total": int(data.size),
             "coverage_segment_pct": float(100 * n_segment / data.size),
             "coverage_ca_pct": float(100 * n_ca_labeled / data.size),
@@ -485,11 +445,9 @@ class CorrespondenceLabeler:
             "n_unique_domains": n_unique_domains,
             "chain_map": chain_to_num,
             "label_files": list(label_files.keys()),
-            "distance_threshold_A": self.distance_threshold,
             "interface_threshold_A": self.interface_threshold,
-            "use_voronoi": self.use_voronoi,
             "bio_assembly_expanded": self.bio_assembly_enabled,
-            "version": "V3",
+            "version": "V3.4",
         }
         with open(os.path.join(entry_dir, "labeling_stats.json"), 'w') as f:
             json.dump(stats, f, indent=2)
